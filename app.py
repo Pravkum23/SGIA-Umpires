@@ -12,25 +12,36 @@ from src.db import get_engine, initialize, rows, save_vote
 from src.routing import is_admin_request
 
 st.set_page_config(page_title="SGIA Umpires", page_icon="🏏", layout="wide")
-st.markdown("""<style>
-:root{--wa-bg:#0b141a;--wa-panel:#202c33;--wa-green:#00a884;--wa-line:#344047;--wa-text:#e9edef;--wa-muted:#8696a0}
-.stApp{background:radial-gradient(circle at 20% 0,#16372d 0,#0b141a 34%);color:var(--wa-text)}
-.block-container{max-width:980px;padding-top:1rem}.brand{display:flex;align-items:center;gap:12px;margin:2px 0 18px}
-.brand-badge{width:52px;height:52px;border-radius:50%;display:grid;place-items:center;background:#fff;color:#0b6b4f;font-weight:900;border:3px solid #ef9935;box-shadow:0 2px 12px #0008}
-.brand-title{font-size:1.45rem;font-weight:800}.brand-sub{font-size:.75rem;color:var(--wa-muted);letter-spacing:.04em}
-.poll-head{background:var(--wa-panel);padding:17px 17px 10px;border-radius:13px 13px 0 0;margin-top:4px}
-.poll-question{font-size:1.03rem;font-weight:600}.poll-instruction,.secondary{color:var(--wa-muted);font-size:.8rem}
-.poll-row-meta{display:flex;align-items:center;gap:8px;margin:-7px 10px 7px 43px;color:var(--wa-muted);font-size:.75rem}
-.vote-bar{height:3px;background:#3b4a52;border-radius:4px;flex:1;overflow:hidden}.vote-fill{height:100%;background:var(--wa-green)}
-.avatars{letter-spacing:-4px;font-size:.68rem;color:#d7f7ed}.view-votes{background:var(--wa-panel);border-top:1px solid var(--wa-line);border-radius:0 0 13px 13px;text-align:center;color:#53bdeb;padding:11px;margin-bottom:12px;font-size:.9rem}
-div[data-testid="stCheckbox"]{background:var(--wa-panel);padding:7px 12px 7px;border-radius:0;margin:0}
-div[data-testid="stCheckbox"] label p{color:var(--wa-text);font-weight:500;font-size:.95rem}
-div[data-testid="stCheckbox"] [data-testid="stCheckbox"]{border-radius:50%}
-div[data-testid="stSelectbox"] label p{color:var(--wa-text)}
-.stButton>button{border-radius:24px;background:var(--wa-green);color:white;border:0;font-weight:700;min-height:44px}
-div[data-testid="stExpander"]{background:var(--wa-panel);border:0;border-radius:10px}
-@media(max-width:640px){.block-container{padding:.55rem .7rem 2rem}.brand{margin-bottom:10px}.brand-badge{width:44px;height:44px}.brand-title{font-size:1.25rem}h1{font-size:1.55rem}}
-</style>""", unsafe_allow_html=True)
+ADMIN_MODE = is_admin_request(st.query_params)
+
+PUBLIC_CSS = """<style>
+:root{--chat:#0b141a;--bubble:#17473b;--bubble-dark:#143c33;--green:#00a884;--line:#356159;--text:#f0f2f5;--muted:#b4c4c0}
+[data-testid="stHeader"],#MainMenu,footer,[data-testid="stToolbar"],[data-testid="stSidebar"]{display:none!important}
+html,body,[data-testid="stAppViewContainer"],.stApp{background:radial-gradient(circle at 50% -10%,#173a32 0,#0b141a 38%,#081014 100%)!important;color:var(--text)}
+.block-container{max-width:500px!important;width:100%!important;padding:18px 15px 36px!important;margin:0 auto!important}
+[data-testid="stVerticalBlock"]{gap:0!important}.stElementContainer:has([data-testid="stImage"]){width:100%!important}[data-testid="stFullScreenFrame"]:has([data-testid="stImage"]){display:flex!important;justify-content:center!important}[data-testid="stImage"]{display:flex!important;justify-content:center!important;margin:0 auto 5px}[data-testid="stImage"] img{width:90px!important;height:90px!important;object-fit:contain;border-radius:50%;background:white;box-shadow:0 5px 18px #0007}
+.brand-copy{text-align:center;margin-bottom:15px}.brand-title{font-size:1.45rem;font-weight:800;line-height:1.2;color:var(--text)}.brand-sub{font-size:.72rem;color:var(--muted);letter-spacing:.1em;margin-top:3px}
+.poll-head{background:var(--bubble);padding:17px 17px 11px;border-radius:15px 15px 0 0;box-shadow:0 7px 22px #0004}
+.poll-question{font-size:1.02rem;font-weight:650;line-height:1.35}.poll-instruction,.secondary{color:var(--muted);font-size:.78rem}.poll-name-label{background:var(--bubble);padding:7px 17px 8px;color:var(--text);font-size:.78rem;font-weight:650;line-height:1.3}
+div[data-testid="stSelectbox"]{background:var(--bubble);padding:0 14px 12px;margin:0}div[data-testid="stSelectbox"]>div>div{background:#0f3029;border-color:#4c716a;border-radius:9px;color:var(--text)}
+.poll-message{background:var(--bubble);color:var(--muted);padding:18px 17px 22px;text-align:center;font-size:.88rem;border-top:1px solid var(--line)}
+div[data-testid="stCheckbox"]{background:var(--bubble);padding:8px 14px 6px;border-radius:0;margin:0;border-top:1px solid rgba(77,113,105,.48)}
+div[data-testid="stCheckbox"] label p{color:var(--text);font-weight:600;font-size:.93rem}div[data-testid="stCheckbox"] label>div:first-child{border-radius:50%!important}
+.poll-row-meta{display:flex;align-items:center;gap:7px;background:var(--bubble);padding:0 14px 8px 44px;color:var(--muted);font-size:.7rem;min-width:0}
+.poll-row-meta .secondary{max-width:44%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.vote-bar{height:4px;background:#40645d;border-radius:5px;flex:1;overflow:hidden}.vote-fill{height:100%;background:#21c99b}
+.avatars{font-size:.65rem;color:#d8fff4;white-space:nowrap}.vote-count{min-width:16px;text-align:right;color:var(--text)}
+.view-votes{background:var(--bubble-dark);border-top:1px solid var(--line);border-radius:0 0 15px 15px;text-align:center;color:#74d7c0;padding:11px;margin-bottom:13px;font-size:.86rem;box-shadow:0 7px 22px #0004}
+.stButton>button{border-radius:24px;background:var(--green);color:white;border:0;font-weight:800;letter-spacing:.035em;min-height:47px;box-shadow:0 5px 15px #0005}.stButton>button:hover{background:#06bd94;color:white}
+.submitted{background:#103c32;border:1px solid #278f77;border-radius:12px;padding:13px 15px;margin:4px 0 12px;color:#eafff9;font-size:.88rem}.submitted strong{display:block;color:#63e6be;font-size:.96rem;margin-bottom:2px}
+div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border-radius:10px;color:var(--text)}
+@media(max-width:430px){.block-container{padding:12px 10px 28px!important}[data-testid="stImage"] img{width:78px!important;height:78px!important}.brand-title{font-size:1.28rem}.poll-head{padding:15px 14px 10px}.poll-name-label{padding-left:14px}.poll-row-meta{padding-left:41px;padding-right:11px}}
+</style>"""
+
+ADMIN_CSS = """<style>
+.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}
+</style>"""
+
+st.markdown(ADMIN_CSS if ADMIN_MODE else PUBLIC_CSS, unsafe_allow_html=True)
 
 
 @st.cache_resource
@@ -41,14 +52,16 @@ def engine():
 
 
 def brand(admin=False):
-    # The official site image is used when reachable; the restrained SGIA badge remains as fallback.
     logo = Path("assets/sgia-logo.png")
-    if logo.exists():
-        left, right = st.columns([1, 8])
+    if not logo.exists():
+        raise FileNotFoundError("Required SGIA logo is missing: assets/sgia-logo.png")
+    if admin:
+        left, right = st.columns([1, 12])
         left.image(str(logo), width=58)
-        right.markdown(f'<div class="brand-title">SGIA Umpires</div><div class="brand-sub">{"ADMIN CONSOLE" if admin else "SINGAPORE INDIAN ASSOCIATION"}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown(f'<div class="brand"><div class="brand-badge">SGIA</div><div><div class="brand-title">SGIA Umpires</div><div class="brand-sub">{"ADMIN CONSOLE" if admin else "SINGAPORE INDIAN ASSOCIATION"}</div></div></div>', unsafe_allow_html=True)
+        right.markdown('<div class="brand-title">SGIA Umpires</div><div class="brand-sub">ADMIN CONSOLE</div>', unsafe_allow_html=True)
+        return
+    st.image(str(logo), width=90)
+    st.markdown('<div class="brand-copy"><div class="brand-title">SGIA Umpires</div><div class="brand-sub">SINGAPORE INDIAN ASSOCIATION</div></div>', unsafe_allow_html=True)
 
 
 def date_label(value):
@@ -59,9 +72,10 @@ def date_label(value):
 def render_public(db):
     brand()
     people = rows(db, "SELECT id,name FROM people WHERE active=true ORDER BY name")
-    person_name = st.selectbox("Your name", [p["name"] for p in people], index=None, placeholder="Select your name")
+    st.markdown('<div class="poll-head"><div class="poll-question">Provide your availability for this weekend</div><div class="poll-instruction">Select one or more</div></div><div class="poll-name-label">Your Name</div>', unsafe_allow_html=True)
+    person_name = st.selectbox("Your Name", [p["name"] for p in people], index=None, placeholder="Select your name", label_visibility="collapsed")
     if not person_name:
-        st.caption("Choose your name to view the current availability poll.")
+        st.markdown('<div class="poll-message">Select your name to view the available slots.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
         return
     person_id = next(p["id"] for p in people if p["name"] == person_name)
     slots = rows(db, """
@@ -71,10 +85,9 @@ def render_public(db):
     """)
     selected = {r["fixture_id"] for r in rows(db, "SELECT fixture_id FROM availability WHERE person_id=:person", {"person": person_id})}
     if not slots:
-        st.info("No availability poll is open right now.")
+        st.markdown('<div class="poll-message">No availability poll is open right now.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
         return
     maximum = max([slot["votes"] for slot in slots] + [1])
-    st.markdown('<div class="poll-head"><div class="poll-question">Provide your availability for upcoming games</div><div class="poll-instruction">Select one or more</div></div>', unsafe_allow_html=True)
     choices = []
     voter_details = []
     for slot in slots:
@@ -84,12 +97,14 @@ def render_public(db):
         voters = rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:fixture ORDER BY p.name", {"fixture": slot["id"]})
         initials = " ".join("".join(part[0] for part in v["name"].split()[:2]).upper() for v in voters[:4])
         width = int(slot["votes"] * 100 / maximum)
-        st.markdown(f'<div class="poll-row-meta"><span class="secondary">{slot["home_team"]} vs {slot["away_team"]}</span><div class="vote-bar"><div class="vote-fill" style="width:{width}%"></div></div><span class="avatars">{initials}</span><b>{slot["votes"]}</b></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="poll-row-meta"><span class="secondary">{slot["home_team"]} vs {slot["away_team"]}</span><div class="vote-bar"><div class="vote-fill" style="width:{width}%"></div></div><span class="avatars">{initials}</span><b class="vote-count">{slot["votes"]}</b></div>', unsafe_allow_html=True)
         voter_details.append((slot, voters))
     st.markdown('<div class="view-votes">View votes</div>', unsafe_allow_html=True)
-    if st.button("Save availability", use_container_width=True, type="primary"):
+    if st.session_state.pop("availability_saved", False):
+        st.markdown('<div class="submitted"><strong>✓ Availability submitted</strong>You can return and update your choices until the poll closes.</div>', unsafe_allow_html=True)
+    if st.button("SAVE MY AVAILABILITY", use_container_width=True, type="primary"):
         save_vote(db, person_id, choices)
-        st.success("Availability saved. You can return later to change it.")
+        st.session_state.availability_saved = True
         st.rerun()
     with st.expander("View votes"):
         for slot, voters in voter_details:
@@ -187,7 +202,7 @@ def render_admin(db):
 
 
 db = engine()
-if is_admin_request(st.query_params):
+if ADMIN_MODE:
     render_admin(db)
 else:
     render_public(db)

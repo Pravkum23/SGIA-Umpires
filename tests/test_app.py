@@ -141,7 +141,8 @@ def test_public_route_has_no_admin_navigation():
     source = Path("app.py").read_text(encoding="utf-8")
     public_body = source.split("def render_public", 1)[1].split("def admin_authenticated", 1)[0]
     assert "Admin" not in public_body
-    assert 'if is_admin_request(st.query_params)' in source
+    assert "ADMIN_MODE = is_admin_request(st.query_params)" in source
+    assert "if ADMIN_MODE:" in source
 
 
 def test_public_page_runtime_has_no_admin_tabs(monkeypatch, tmp_path):
@@ -150,6 +151,30 @@ def test_public_page_runtime_has_no_admin_tabs(monkeypatch, tmp_path):
     assert not list(page.exception)
     assert len(page.tabs) == 0
     assert not any("Admin" in getattr(item, "value", "") for item in page.markdown)
+    rendered = " ".join(getattr(item, "value", "") for item in page.markdown)
+    assert "Provide your availability for this weekend" in rendered
+    assert "Select your name to view the available slots." in rendered
+
+
+def test_public_brand_asset_and_mobile_layout_are_required():
+    root = Path(__file__).parents[1]
+    logo = root / "assets" / "sgia-logo.png"
+    assert logo.is_file()
+    assert logo.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    source = (root / "app.py").read_text(encoding="utf-8")
+    assert "max-width:500px!important" in source
+    assert "brand-badge" not in source
+    assert 'raise FileNotFoundError("Required SGIA logo is missing' in source
+
+
+def test_admin_query_route_still_renders_login(monkeypatch, tmp_path):
+    monkeypatch.setenv("SGIA_SQLITE_PATH", str(tmp_path / "admin.db"))
+    monkeypatch.setenv("SGIA_ADMIN_PIN", "test-only-pin")
+    page = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    page.query_params["admin"] = "1"
+    page.run(timeout=20)
+    assert not list(page.exception)
+    assert any(item.label == "Admin PIN" for item in page.text_input)
 
 
 def test_confirmed_allocation_message():
