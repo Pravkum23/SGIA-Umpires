@@ -32,12 +32,27 @@ def database_url():
 def get_engine(url=None):
     return create_engine(url or database_url(), pool_pre_ping=True)
 
+def people_seed_params():
+    """Return PostgreSQL-safe bound parameters for the initial people seed."""
+    return [
+        {"n": name, "u": bool(ump), "s": bool(score), "p": pref}
+        for name, ump, score, pref in PEOPLE
+    ]
+
 def initialize(engine):
     with engine.begin() as c:
         for statement in schema_for(engine.dialect.name).split(";"):
             if statement.strip(): c.execute(text(statement))
-        for name, ump, score, pref in PEOPLE:
-            c.execute(text("INSERT INTO people(name,can_umpire,can_score,preferred_role,active) VALUES(:n,:u,:s,:p,true) ON CONFLICT(name) DO NOTHING"), {"n":name,"u":ump,"s":score,"p":pref})
+        for params in people_seed_params():
+            c.execute(
+                text(
+                    "INSERT INTO people"
+                    "(name,can_umpire,can_score,preferred_role,active) "
+                    "VALUES(:n,:u,:s,:p,true) "
+                    "ON CONFLICT(name) DO NOTHING"
+                ),
+                params,
+            )
         for dt, home, away in FIXTURES:
             c.execute(text("INSERT INTO fixtures(starts_at,home_team,away_team,availability_open) VALUES(:d,:h,:a,false) ON CONFLICT(starts_at) DO NOTHING"), {"d":dt,"h":home,"a":away})
         # Idempotent upgrade from the original two-role staffing model.
