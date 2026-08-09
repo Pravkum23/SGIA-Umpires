@@ -1,0 +1,6 @@
+streamlit>=1.37,<2
+SQLAlchemy>=2.0,<3
+psycopg2-binary>=2.9,<3
+pandas>=2.0,<3
+pytest>=8,<9
+
