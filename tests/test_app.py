@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, text
 from streamlit.testing.v1 import AppTest
 
 from src.allocation import allocation_message, propose
+from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, rows, save_vote, schema_for
 from src.routing import is_admin_request
 
@@ -82,7 +83,27 @@ def test_closed_poll_votes_can_still_be_allocated():
     with engine.begin() as connection:
         connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id=1"))
     propose(engine)
-    assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"] == 2
+    assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"] == 3
+
+
+def test_three_role_staffing_model_is_proposed():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    proposed = rows(engine, "SELECT role FROM assignments WHERE fixture_id=1 ORDER BY role")
+    assert proposed == [{"role": "scorer"}, {"role": "umpire_1"}, {"role": "umpire_2"}]
+    assert rows(engine, "SELECT COUNT(DISTINCT person_id) n FROM assignments WHERE fixture_id=1")[0]["n"] == 3
+
+
+def test_legacy_umpire_storage_is_migrated_idempotently():
+    engine = db()
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,reason) VALUES(1,'umpire',1,true,'Legacy')"))
+    initialize(engine)
+    initialize(engine)
+    assert rows(engine, "SELECT role,person_id,confirmed FROM assignments") == [
+        {"role": "umpire_1", "person_id": 1, "confirmed": 1}
+    ]
 
 
 def test_regenerate_changes_only_unconfirmed_and_preserves_confirmed_exactly():
@@ -119,8 +140,11 @@ def test_weekend_pair_is_back_to_back_opposite_roles_without_third_duty():
     propose(engine)
     paired = rows(engine, """
         SELECT p.name FROM assignments first
-        JOIN assignments second ON second.fixture_id=2 AND second.role<>first.role AND second.person_id=first.person_id
-        JOIN people p ON p.id=first.person_id WHERE first.fixture_id=1
+        JOIN assignments second ON second.fixture_id=2 AND second.person_id=first.person_id
+        JOIN people p ON p.id=first.person_id
+        WHERE first.fixture_id=1
+          AND ((first.role='scorer' AND second.role IN ('umpire_1','umpire_2'))
+            OR (second.role='scorer' AND first.role IN ('umpire_1','umpire_2')))
     """)
     assert paired
     triple = rows(engine, "SELECT person_id,COUNT(*) n FROM assignments WHERE fixture_id IN (1,2,3) GROUP BY person_id HAVING COUNT(*)>2")
@@ -131,8 +155,39 @@ def test_weekday_opposite_role_balance_when_available():
     engine = db()
     open_and_vote_all(engine, [8, 9])  # Tuesday and Wednesday
     propose(engine)
-    balanced = rows(engine, "SELECT person_id,COUNT(DISTINCT role) roles FROM assignments WHERE fixture_id IN (8,9) GROUP BY person_id HAVING COUNT(DISTINCT role)=2")
+    balanced = rows(engine, """
+        SELECT person_id FROM assignments WHERE fixture_id IN (8,9)
+        GROUP BY person_id
+        HAVING SUM(CASE WHEN role='scorer' THEN 1 ELSE 0 END)>0
+           AND SUM(CASE WHEN role IN ('umpire_1','umpire_2') THEN 1 ELSE 0 END)>0
+    """)
     assert balanced
+
+
+def test_allocation_board_columns_and_manual_save():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    board = allocation_board(engine)
+    assert list({key: None for key in board[0] if key != "fixture_id"}) == BOARD_COLUMNS
+    original = board[0]["Umpire 1"]
+    replacement = next(row["name"] for row in rows(engine, "SELECT name FROM people WHERE active=true ORDER BY name") if row["name"] not in {original, board[0]["Umpire 2"], board[0]["Scorer"]})
+    board[0]["Umpire 1"] = replacement
+    save_allocation_board(engine, board)
+    saved = rows(engine, """
+        SELECT p.name,a.confirmed,a.reason FROM assignments a JOIN people p ON p.id=a.person_id
+        WHERE a.fixture_id=1 AND a.role='umpire_1'
+    """)[0]
+    assert saved == {"name": replacement, "confirmed": 1, "reason": "Admin allocation board"}
+
+
+def test_allocation_board_png_export():
+    engine = db()
+    open_and_vote_all(engine, [1, 2])
+    propose(engine)
+    image = allocation_board_png(allocation_board(engine), Path(__file__).parents[1] / "assets" / "sgia-logo.png")
+    assert image.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(image) > 10_000
 
 
 def test_public_route_has_no_admin_navigation():
@@ -183,4 +238,7 @@ def test_confirmed_allocation_message():
     propose(engine)
     with engine.begin() as connection:
         connection.execute(text("UPDATE assignments SET confirmed=true"))
-    assert "SGIA Umpires" in allocation_message(engine)
+    message = allocation_message(engine)
+    assert "SGIA Umpires" in message
+    assert "Umpire 1:" in message
+    assert "Umpire 2:" in message

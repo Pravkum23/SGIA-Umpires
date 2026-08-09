@@ -8,6 +8,7 @@ import streamlit as st
 from sqlalchemy import text
 
 from src.allocation import allocation_message, propose
+from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import get_engine, initialize, rows, save_vote
 from src.routing import is_admin_request
 
@@ -137,7 +138,7 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
-    control, allocation, people_tab, output = st.tabs(["Open slots", "Allocations", "People", "Output"])
+    control, allocation, board_tab, people_tab, output = st.tabs(["Open slots", "Allocations", "Allocation Board", "People", "Output"])
     with control:
         fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
         opened = []
@@ -170,13 +171,45 @@ def render_admin(db):
                 st.write(f"**{pd.Timestamp(assignment['starts_at']).strftime('%a %d %b, %I:%M %p')}** · {assignment['home_team']} vs {assignment['away_team']}")
                 names = [p["name"] for p in eligible]
                 current = next(p["name"] for p in active if p["id"] == assignment["person_id"])
-                choice = st.selectbox(assignment["role"].title(), names, index=names.index(current), key=f"assign_{assignment['fixture_id']}_{assignment['role']}", disabled=bool(assignment["confirmed"]))
+                role_label = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}.get(assignment["role"], assignment["role"].title())
+                choice = st.selectbox(role_label, names, index=names.index(current), key=f"assign_{assignment['fixture_id']}_{assignment['role']}", disabled=bool(assignment["confirmed"]))
                 st.caption(("Confirmed · " if assignment["confirmed"] else "Proposed · ") + (assignment["reason"] or "Manual selection"))
                 if not assignment["confirmed"] and st.button("Save & confirm", key=f"confirm_{assignment['fixture_id']}_{assignment['role']}"):
                     chosen = next(p["id"] for p in eligible if p["name"] == choice)
                     with db.begin() as connection:
                         connection.execute(text("UPDATE assignments SET person_id=:person,confirmed=true,reason='Admin confirmed' WHERE fixture_id=:fixture AND role=:role"), {"person": chosen, "fixture": assignment["fixture_id"], "role": assignment["role"]})
                     st.rerun()
+    with board_tab:
+        st.subheader("Final Allocation Board")
+        board_rows = allocation_board(db)
+        if not board_rows:
+            st.info("Generate proposed allocations first to populate the board.")
+        else:
+            active_names = [person["name"] for person in rows(db, "SELECT name FROM people WHERE active=true ORDER BY name")]
+            board_frame = pd.DataFrame(board_rows)
+            edited_board = st.data_editor(
+                board_frame,
+                hide_index=True,
+                use_container_width=True,
+                disabled=["fixture_id", "Day", "Date", "Time", "TEAM 1", "TEAM 2"],
+                column_config={
+                    "fixture_id": None,
+                    "Umpire 1": st.column_config.SelectboxColumn("Umpire 1", options=active_names, required=True),
+                    "Umpire 2": st.column_config.SelectboxColumn("Umpire 2", options=active_names, required=True),
+                    "Scorer": st.column_config.SelectboxColumn("Scorer", options=active_names, required=True),
+                },
+                key="allocation_board_editor",
+            )
+            if st.button("Save Final Allocation Board", type="primary"):
+                save_allocation_board(db, edited_board.to_dict("records"))
+                st.success("Final allocation board saved and confirmed.")
+                st.rerun()
+            preview_records = edited_board.to_dict("records")
+            png = allocation_board_png(preview_records, "assets/sgia-logo.png")
+            st.subheader("Image Preview")
+            st.image(png, use_container_width=True)
+            st.download_button("Download PNG", png, "sgia-official-allocation.png", "image/png")
+            st.download_button("Download Board CSV", edited_board[BOARD_COLUMNS].to_csv(index=False), "sgia-allocation-board.csv", "text/csv")
     with people_tab:
         roster = rows(db, "SELECT * FROM people ORDER BY name")
         edited = st.data_editor(pd.DataFrame(roster), disabled=["id"], hide_index=True, num_rows="dynamic")
@@ -191,7 +224,7 @@ def render_admin(db):
                         connection.execute(text("UPDATE people SET name=:name,can_umpire=:umpire,can_score=:score,preferred_role=:preferred,active=:active WHERE id=:id"), values)
             st.success("People saved")
             st.rerun()
-        workload = rows(db, "SELECT p.name,SUM(CASE WHEN a.role='umpire' THEN 1 ELSE 0 END) umpiring,SUM(CASE WHEN a.role='scorer' THEN 1 ELSE 0 END) scoring,COUNT(a.role) total,MAX(f.starts_at) last_duty FROM people p LEFT JOIN assignments a ON a.person_id=p.id LEFT JOIN fixtures f ON f.id=a.fixture_id GROUP BY p.id,p.name ORDER BY total,p.name")
+        workload = rows(db, "SELECT p.name,SUM(CASE WHEN a.role IN ('umpire_1','umpire_2') THEN 1 ELSE 0 END) umpiring,SUM(CASE WHEN a.role='scorer' THEN 1 ELSE 0 END) scoring,COUNT(a.role) total,MAX(f.starts_at) last_duty FROM people p LEFT JOIN assignments a ON a.person_id=p.id LEFT JOIN fixtures f ON f.id=a.fixture_id GROUP BY p.id,p.name ORDER BY total,p.name")
         st.subheader("Workload")
         st.dataframe(workload, use_container_width=True, hide_index=True)
     with output:

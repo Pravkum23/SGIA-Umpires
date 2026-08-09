@@ -40,6 +40,16 @@ def initialize(engine):
             c.execute(text("INSERT INTO people(name,can_umpire,can_score,preferred_role,active) VALUES(:n,:u,:s,:p,true) ON CONFLICT(name) DO NOTHING"), {"n":name,"u":ump,"s":score,"p":pref})
         for dt, home, away in FIXTURES:
             c.execute(text("INSERT INTO fixtures(starts_at,home_team,away_team,availability_open) VALUES(:d,:h,:a,false) ON CONFLICT(starts_at) DO NOTHING"), {"d":dt,"h":home,"a":away})
+        # Idempotent upgrade from the original two-role staffing model.
+        c.execute(text("""
+            UPDATE assignments SET role='umpire_1'
+            WHERE role='umpire'
+              AND NOT EXISTS (
+                SELECT 1 FROM assignments newer
+                WHERE newer.fixture_id=assignments.fixture_id AND newer.role='umpire_1'
+              )
+        """))
+        c.execute(text("DELETE FROM assignments WHERE role='umpire'"))
 
 def rows(engine, sql, params=None):
     with engine.connect() as c: return [dict(r) for r in c.execute(text(sql), params or {}).mappings()]

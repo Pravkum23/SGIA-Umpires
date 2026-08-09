@@ -23,7 +23,7 @@ def propose(engine, regenerate_unconfirmed=False):
         for (fixture_id, role), assignment in existing.items():
             fixture = next((f for f in fixtures if f.id == fixture_id), None)
             totals[assignment.person_id] += 1
-            roles[assignment.person_id][role] += 1
+            roles[assignment.person_id]["scorer" if role == "scorer" else "umpire"] += 1
             if fixture: schedule[assignment.person_id].append((_dt(fixture.starts_at), role))
 
         for index, fixture in enumerate(fixtures):
@@ -35,41 +35,45 @@ def propose(engine, regenerate_unconfirmed=False):
             previous = fixtures[index - 1] if index else None
             consecutive_previous = previous and _dt(previous.starts_at).date() == starts.date()
 
-            for role in ("umpire", "scorer"):
+            for role in ("umpire_1", "umpire_2", "scorer"):
                 if (fixture.id, role) in existing:
                     continue  # every retained assignment, especially confirmed ones, is immutable here
                 capability = "can_score" if role == "scorer" else "can_umpire"
-                other_role = "scorer" if role == "umpire" else "umpire"
-                other_here = existing.get((fixture.id, other_role))
-                eligible = [p for p in candidates if p[capability] and (not other_here or p.id != other_here.person_id)]
+                role_group = "scorer" if role == "scorer" else "umpire"
+                other_group = "umpire" if role_group == "scorer" else "scorer"
+                assigned_here = {assignment.person_id for (fixture_id, _), assignment in existing.items() if fixture_id == fixture.id}
+                eligible = [p for p in candidates if p[capability] and p.id not in assigned_here]
                 if not eligible:
                     continue
 
                 def rank(person):
                     back_to_back = 1
                     if starts.weekday() >= 5 and consecutive_previous:
-                        prior = existing.get((previous.id, other_role))
-                        if prior and prior.person_id == person.id:
+                        prior_people = {
+                            assignment.person_id for (fixture_id, prior_role), assignment in existing.items()
+                            if fixture_id == previous.id and ((other_group == "scorer" and prior_role == "scorer") or (other_group == "umpire" and prior_role.startswith("umpire_")))
+                        }
+                        if person.id in prior_people:
                             back_to_back = 0
 
                     same_day_times = [d for d, _ in schedule[person.id] if d.date() == starts.date()]
                     already_paired = int(len(same_day_times) >= 2)
                     has_gap = int(any(abs((starts - d).total_seconds()) > 5 * 3600 for d in same_day_times))
                     weekday_complement = 1
-                    if starts.weekday() < 5 and roles[person.id][other_role] > roles[person.id][role]:
+                    if starts.weekday() < 5 and roles[person.id][other_group] > roles[person.id][role_group]:
                         weekday_complement = 0
                     praveen = 0 if role == "scorer" and person.name == "Praveen" else 1
-                    if role == "umpire" and person.name == "Praveen":
+                    if role_group == "umpire" and person.name == "Praveen":
                         praveen = 3
-                    preferred = 0 if person.preferred_role.lower() in (role, "either") else 1
+                    preferred = 0 if person.preferred_role.lower() in (role_group, "either") else 1
                     weekend_priority = (already_paired, back_to_back, has_gap) if starts.weekday() >= 5 else (0, 0, 0)
-                    return (*weekend_priority, weekday_complement, praveen, totals[person.id], roles[person.id][role], preferred, person.name)
+                    return (*weekend_priority, weekday_complement, praveen, totals[person.id], roles[person.id][role_group], preferred, person.name)
 
                 chosen = min(eligible, key=rank)
                 ranking = rank(chosen)
                 if starts.weekday() >= 5 and ranking[1] == 0:
                     reason = "back-to-back weekend pairing; opposite role; one ground visit"
-                elif starts.weekday() < 5 and roles[chosen.id][other_role] > roles[chosen.id][role]:
+                elif starts.weekday() < 5 and roles[chosen.id][other_group] > roles[chosen.id][role_group]:
                     reason = "weekday umpire/scorer balance; available and eligible"
                 elif chosen.name == "Praveen" and role == "scorer":
                     reason = "preferred scorer; available and eligible"
@@ -82,7 +86,7 @@ def propose(engine, regenerate_unconfirmed=False):
                 assignment = type("Assignment", (), {"person_id": chosen.id, "confirmed": False})()
                 existing[(fixture.id, role)] = assignment
                 totals[chosen.id] += 1
-                roles[chosen.id][role] += 1
+                roles[chosen.id][role_group] += 1
                 schedule[chosen.id].append((starts, role))
 
 
@@ -104,5 +108,7 @@ def allocation_message(engine):
             lines += [f"*{dt.strftime('%A, %d %b')}*", ""]
             last_date = dt.date()
         lines += [dt.strftime("%I:%M %p").lstrip("0"), f"{home} vs {away}",
-                  f"Umpire: {assigned.get('umpire', 'TBC')}", f"Scorer: {assigned.get('scorer', 'TBC')}", ""]
+                  f"Umpire 1: {assigned.get('umpire_1', 'TBC')}",
+                  f"Umpire 2: {assigned.get('umpire_2', 'TBC')}",
+                  f"Scorer: {assigned.get('scorer', 'TBC')}", ""]
     return "\n".join(lines)
