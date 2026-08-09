@@ -15,7 +15,7 @@ Without a production database URL, the app uses `sgia_umpires.db` for local deve
 
 ## Streamlit Community Cloud
 
-Deploy repository `Pravkum23/SGIA-Umpires`, branch `main`, entry point `app.py`. In **App settings → Secrets**, add:
+Deploy repository `Pravkum23/SGIA-Umpires`, branch `main`, entry point `app.py`. The normal URL is the volunteer-only poll. Append `?admin=1` for the PIN-protected console. In **App settings → Secrets**, add:
 
 ```toml
 SGIA_ADMIN_PIN = "a-long-private-pin"
@@ -33,4 +33,4 @@ Use the Supabase transaction-pooler or direct Postgres connection string. Escape
 - `schema.sql`: Postgres/Supabase schema
 - `tests/`: persistence, rules, updates, seed, and output checks
 
-Confirmed duties are preserved by regeneration. Administrators remain responsible for reviewing and confirming all proposed allocations.
+Closing a poll only prevents further voting; its saved responses remain available for allocation. Regenerating unconfirmed proposals deletes and recalculates only unconfirmed rows, while confirmed duties remain immutable. Administrators remain responsible for reviewing and confirming all proposed allocations.
