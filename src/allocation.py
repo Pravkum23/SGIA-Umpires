@@ -19,6 +19,10 @@ def propose(engine, regenerate_unconfirmed=False):
             ORDER BY f.starts_at
         """)).mappings())
         existing = {(r.fixture_id, r.role): r for r in c.execute(text("SELECT * FROM assignments")).mappings()}
+        season = {
+            row.person_id: (int(row.games_completed), int(row.total_assigned))
+            for row in c.execute(text("SELECT person_id,games_completed,total_assigned FROM season_workload")).mappings()
+        }
         totals, roles, schedule = defaultdict(int), defaultdict(lambda: defaultdict(int)), defaultdict(list)
         for (fixture_id, role), assignment in existing.items():
             fixture = next((f for f in fixtures if f.id == fixture_id), None)
@@ -67,18 +71,20 @@ def propose(engine, regenerate_unconfirmed=False):
                         praveen = 3
                     preferred = 0 if person.preferred_role.lower() in (role_group, "either") else 1
                     weekend_priority = (already_paired, back_to_back, has_gap) if starts.weekday() >= 5 else (0, 0, 0)
-                    return (*weekend_priority, weekday_complement, praveen, totals[person.id], roles[person.id][role_group], preferred, person.name)
+                    completed, assigned = season.get(person.id, (0, 0))
+                    return (*weekend_priority, weekday_complement, praveen, preferred,
+                            completed, assigned, totals[person.id], roles[person.id][role_group], person.name)
 
                 chosen = min(eligible, key=rank)
                 ranking = rank(chosen)
                 if starts.weekday() >= 5 and ranking[1] == 0:
-                    reason = "back-to-back weekend pairing; opposite role; one ground visit"
+                    reason = "Back-to-back pairing preferred; workload balanced"
                 elif starts.weekday() < 5 and roles[chosen.id][other_group] > roles[chosen.id][role_group]:
-                    reason = "weekday umpire/scorer balance; available and eligible"
+                    reason = "Weekday umpire/scorer balance; workload balanced"
                 elif chosen.name == "Praveen" and role == "scorer":
-                    reason = "preferred scorer; available and eligible"
+                    reason = "Preferred scorer; available and eligible"
                 else:
-                    reason = "available and eligible; lowest practical workload"
+                    reason = "Available and balances season workload"
                 c.execute(text("""
                     INSERT INTO assignments(fixture_id,role,person_id,confirmed,reason)
                     VALUES(:fixture,:role,:person,false,:reason)

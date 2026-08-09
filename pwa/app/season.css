@@ -1,0 +1,8 @@
+.season-card { background: linear-gradient(135deg, #164d3f, #10342c); border: 1px solid var(--line); border-radius: 14px; padding: 15px; margin: 18px 0 4px; }
+.season-card > small { color: #64dbbc; font-weight: 800; letter-spacing: .1em; }
+.season-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 12px; }
+.season-grid div { text-align: center; }
+.season-grid b { display: block; font-size: 1.3rem; }
+.season-grid span { display: block; color: var(--muted); font-size: .66rem; margin-top: 3px; }
+.season-card p { color: var(--muted); font-size: .78rem; margin: 12px 0 0; }
+@media (max-width: 390px) { .season-grid { grid-template-columns: repeat(2, 1fr); row-gap: 12px; } }

@@ -1,4 +1,5 @@
 import {describe,it,expect} from "vitest";import fs from "node:fs";import path from "node:path";
+import {formatFixtureDateTime,formatFixtureTime,SGIA_TIMEZONE} from "../lib/sgia-time";
 const root=process.cwd(),read=(p:string)=>fs.readFileSync(path.join(root,p),"utf8");
 describe("PWA production contract",()=>{
 it("has valid install manifest and icons",()=>{const m=JSON.parse(read("public/manifest.webmanifest"));expect(m.display).toBe("standalone");for(const i of m.icons)expect(fs.existsSync(path.join(root,"public",i.src))).toBe(true)});
@@ -8,4 +9,8 @@ it("matches PBKDF2 SHA256 format",()=>{const s=read("lib/auth.ts");expect(s).toC
 it("supports open edit, prepopulation and removal audits",()=>{const s=read("lib/poll.ts");expect(s).toContain("poll_state='OPEN'");expect(s).toContain("REMOVED");expect(s).toContain("BOOL_OR")});
 it("supports frozen and published duty withdrawal",()=>{expect(read("app/page.tsx")).toMatch(/poll\.state\s*===\s*"FROZEN"/);expect(read("lib/duties.ts")).toContain("REPLACEMENT_REQUIRED");expect(read("lib/duties.ts")).toContain("WITHDRAWN")});
 it("never imports database modules in client",()=>{const client=read("app/page.tsx");expect(client).not.toContain("DATABASE_URL");expect(client).not.toContain("pin_hash");expect(client).not.toContain("@/lib/db")});
-it("provides four-item mobile navigation and hidden admin route",()=>{const s=read("app/page.tsx");for(const x of ["Home","Availability","My Duties","Profile"])expect(s).toContain(x);expect(fs.existsSync(path.join(root,"app/admin-link/page.tsx"))).toBe(true)})});
+it("provides four-item mobile navigation and hidden admin route",()=>{const s=read("app/page.tsx");for(const x of ["Home","Availability","My Duties","Profile"])expect(s).toContain(x);expect(fs.existsSync(path.join(root,"app/admin-link/page.tsx"))).toBe(true)});
+it("serves only authenticated volunteer season stats",()=>{const route=read("app/api/stats/route.ts");expect(route).toContain("session()");expect(route).toContain("person.id");expect(route).not.toContain("searchParams");expect(route).not.toContain("personId");expect(read("lib/stats.ts")).toContain("season_workload");expect(read("app/page.tsx")).toContain("MY SEASON")});
+it("renders SGIA wall-clock fixtures identically in every runtime timezone",()=>{expect(SGIA_TIMEZONE).toBe("Asia/Singapore");for(const zone of ["UTC","Asia/Kolkata","Asia/Singapore","America/New_York"]){process.env.TZ=zone;expect(formatFixtureDateTime("2026-08-15T11:00:00+08:00")).toBe("Saturday · 11:00 AM");}expect(formatFixtureTime("2026-08-15T15:00:00+08:00")).toBe("3:00 PM");expect(formatFixtureTime("2026-08-15T19:00:00+08:00")).toBe("7:00 PM");expect(formatFixtureTime("2026-08-16T07:30:00+08:00")).toBe("7:30 AM")});
+it("serializes timestamp-without-timezone values with Singapore offset",()=>{for(const source of [read("lib/poll.ts"),read("lib/duties.ts")]){expect(source).toContain("singaporeTimestampSql");}expect(read("lib/sgia-time.ts")).toContain("+08:00");expect(read("app/page.tsx")).not.toContain("toLocaleTimeString")});
+});

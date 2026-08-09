@@ -24,6 +24,12 @@ DATABASE_URL = "postgresql://postgres.PROJECT:PASSWORD@HOST:5432/postgres?sslmod
 
 Use the Supabase transaction-pooler or direct Postgres connection string. Escape special password characters as URL encoding. Never commit the values. `SUPABASE_DB_URL` is accepted as an alternative to `DATABASE_URL`. The app initializes the schema automatically; `schema.sql` is supplied for explicit provisioning.
 
+## Season Workload & Fairness
+
+Completed games are counted only after an administrator marks a published match **COMPLETED**. Cancelled matches do not count, and restoring a match to **SCHEDULED** removes its completed contribution automatically without deleting assignments or history. The admin console shows the full active-person comparison and CSV export; authenticated volunteers see only their own **My Season** statistics in the PWA.
+
+The allocator uses completed and upcoming confirmed workload only as an explainable tie-breaker after availability, eligibility, role preferences, and practical back-to-back or weekday pairing rules. It does not expose or calculate an arbitrary fairness score.
+
 ## Architecture
 
 - `app.py`: public poll and PIN-protected admin UI

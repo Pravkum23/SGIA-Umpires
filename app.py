@@ -15,6 +15,7 @@ from src.db import get_engine, initialize, rows, save_vote
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
 from src.routing import is_admin_request
+from src.workload import fixture_history, season_workload, set_match_status
 
 st.set_page_config(page_title="SGIA Umpires", page_icon="🏏", layout="wide")
 ADMIN_MODE = is_admin_request(st.query_params)
@@ -44,7 +45,7 @@ div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border
 </style>"""
 
 ADMIN_CSS = """<style>
-.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}
+.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}
 @media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}}
 </style>"""
 
@@ -217,7 +218,7 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
-    quick_tab, control, fixtures_tab, allocation, board_tab, people_tab, history_tab, output = st.tabs(["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "History", "Output"])
+    quick_tab, control, fixtures_tab, allocation, board_tab, people_tab, workload_tab, history_tab, output = st.tabs(["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"])
     with quick_tab:
         st.subheader("Quick Admin")
         upcoming = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP")[0]["count"]
@@ -227,6 +228,14 @@ def render_admin(db):
         cards = st.columns(2)
         for index, (value, label) in enumerate(((upcoming,"Upcoming Matches"),(open_count,"Open Poll"),(responses,"Responses"),(required,"Replacement Required"))):
             cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
+        st.markdown("#### Season workload")
+        for person in season_workload(db)[:5]:
+            st.markdown(
+                f'<div class="quick-card"><strong>{person["name"]}</strong><br>'
+                f'<span class="quick-label">Completed {person["games_completed"]} · Umpire {person["umpire_completed"]} · '
+                f'Scorer {person["scorer_completed"]} · Upcoming {person["upcoming_duties"]} · Total {person["total_assigned"]}</span></div>',
+                unsafe_allow_html=True,
+            )
         st.markdown("#### Quick actions")
         qa1, qa2 = st.columns(2)
         if qa1.button("FREEZE POLL", key="quick_freeze"):
@@ -253,15 +262,24 @@ def render_admin(db):
             try: quick_add(True)
             except ValueError as error: st.error(str(error))
         st.markdown("#### Matches")
-        mobile_fixtures = rows(db,"SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id WHERE f.starts_at>=CURRENT_TIMESTAMP GROUP BY f.id ORDER BY f.starts_at LIMIT 12")
+        mobile_fixtures = rows(db,"SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
         for fixture in mobile_fixtures:
             with st.expander(f"{pd.Timestamp(fixture['starts_at']).strftime('%a %d %b · %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']}"):
-                st.write(f"**{fixture['poll_state']}** · {fixture['responses']} available")
+                st.markdown(f'<span class="match-badge status-{fixture["match_status"].lower()}">{fixture["match_status"]}</span> · {fixture["poll_state"]} · {fixture["responses"]} available', unsafe_allow_html=True)
                 action_cols=st.columns(4)
                 for idx,(label,state) in enumerate((("Open","OPEN"),("Close","CLOSED"),("Freeze","FROZEN"),("Publish","PUBLISHED"))):
                     if action_cols[idx].button(label,key=f"mobile_state_{fixture['id']}_{state}"):
                         with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state=:state,availability_open=:opened WHERE id=:id"),{"state":state,"opened":state=="OPEN","id":fixture["id"]})
                         st.rerun()
+                match_actions = st.columns(3)
+                for idx, (label, status) in enumerate((("MARK COMPLETED", "COMPLETED"), ("MARK CANCELLED", "CANCELLED"), ("RESTORE TO SCHEDULED", "SCHEDULED"))):
+                    if match_actions[idx].button(label, key=f"match_status_{fixture['id']}_{status}"):
+                        try:
+                            set_match_status(db, fixture["id"], status)
+                            st.success(f"Match is now {status}.")
+                            st.rerun()
+                        except ValueError as error:
+                            st.warning(str(error))
         st.markdown("#### Final allocation")
         quick_board = allocation_board(db)
         active_names = [person["name"] for person in rows(db,"SELECT name FROM people WHERE active=true ORDER BY name")]
@@ -464,9 +482,31 @@ def render_admin(db):
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
-        workload = rows(db, "SELECT p.name,SUM(CASE WHEN a.role IN ('umpire_1','umpire_2') THEN 1 ELSE 0 END) umpiring,SUM(CASE WHEN a.role='scorer' THEN 1 ELSE 0 END) scoring,COUNT(a.role) total,MAX(f.starts_at) last_duty FROM people p LEFT JOIN assignments a ON a.person_id=p.id LEFT JOIN fixtures f ON f.id=a.fixture_id GROUP BY p.id,p.name ORDER BY total,p.name")
-        st.subheader("Workload")
-        st.dataframe(workload, use_container_width=True, hide_index=True)
+    with workload_tab:
+        st.subheader("Season Workload")
+        st.caption("Completed work counts only confirmed, active duties on matches marked COMPLETED. Workload is used only as an allocation tie-breaker.")
+        workload_search = st.text_input("Search person", key="workload_search").strip().lower()
+        workload = season_workload(db)
+        if workload_search:
+            workload = [person for person in workload if workload_search in person["name"].lower()]
+        workload_frame = pd.DataFrame(workload).rename(columns={
+            "name": "Person", "games_completed": "Completed", "umpire_completed": "Umpire",
+            "scorer_completed": "Scorer", "upcoming_duties": "Upcoming", "total_assigned": "Total Assigned",
+        })
+        if not workload_frame.empty:
+            desktop_columns = ["Person", "Completed", "Umpire", "Scorer", "Upcoming", "Total Assigned"]
+            st.dataframe(workload_frame[desktop_columns], hide_index=True, use_container_width=True)
+            st.download_button("Download Workload CSV", workload_frame[desktop_columns].to_csv(index=False), "sgia-season-workload.csv", "text/csv")
+            st.markdown("#### Mobile summary")
+            for person in workload:
+                st.markdown(
+                    f'<div class="quick-card"><strong>{person["name"]}</strong><br>Completed {person["games_completed"]}<br>'
+                    f'<span class="quick-label">Umpire {person["umpire_completed"]} | Scorer {person["scorer_completed"]}<br>'
+                    f'Upcoming {person["upcoming_duties"]} · Total {person["total_assigned"]}</span></div>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No active people match this search.")
     with history_tab:
         st.subheader("Assignment History")
         history = assignment_history(db)
@@ -489,6 +529,18 @@ def render_admin(db):
                     continue
                 display.append({"Date": starts.strftime("%d-%b-%Y"), "Time": starts.strftime("%I:%M %p").lstrip("0"), "Match": f"{item['home_team']} vs {item['away_team']}", "Role": item["role"].replace("_", " ").title(), "Person": item["person"], "Action": item["action"], "Replacement": item["replacement"] or "", "Reason": item["reason"] or "", "Timestamp": item["created_at"]})
             st.dataframe(pd.DataFrame(display), hide_index=True, use_container_width=True)
+        st.subheader("Match Status History")
+        match_history = fixture_history(db)
+        if match_history:
+            st.dataframe(pd.DataFrame([{
+                "Date": pd.Timestamp(item["starts_at"]).strftime("%d-%b-%Y"),
+                "Time": pd.Timestamp(item["starts_at"]).strftime("%I:%M %p").lstrip("0"),
+                "Match": f'{item["home_team"]} vs {item["away_team"]}',
+                "Action": item["action"], "Previous": item["previous_status"], "New": item["new_status"],
+                "Timestamp": item["created_at"],
+            } for item in match_history]), hide_index=True, use_container_width=True)
+        else:
+            st.info("No match status events recorded yet.")
     with output:
         message = allocation_message(db)
         st.text_area("Copy-ready allocation", message, height=360)
