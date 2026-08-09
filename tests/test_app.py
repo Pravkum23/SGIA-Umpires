@@ -6,6 +6,7 @@ from streamlit.testing.v1 import AppTest
 from src.allocation import allocation_message, propose
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
+from src.lifecycle import availability_for_person, forget_person, person_for_token, remember_person, suggest_replacement, withdraw_assignment
 from src.routing import is_admin_request
 
 
@@ -18,7 +19,7 @@ def db():
 def open_and_vote_all(engine, fixture_ids):
     with engine.begin() as connection:
         for fixture_id in fixture_ids:
-            connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id=:id"), {"id": fixture_id})
+            connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=:id"), {"id": fixture_id})
             connection.execute(text("INSERT INTO availability(person_id,fixture_id) SELECT id,:id FROM people"), {"id": fixture_id})
 
 
@@ -32,23 +33,23 @@ def test_seed_is_idempotent_and_exact():
 def test_vote_can_change_and_closed_slots_are_not_public():
     engine = db()
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id IN (1,2)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (1,2)"))
     save_vote(engine, 1, [1, 2])
     save_vote(engine, 1, [2])
     assert rows(engine, "SELECT fixture_id FROM availability WHERE person_id=1") == [{"fixture_id": 2}]
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id=2"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id=2"))
     assert rows(engine, "SELECT id FROM fixtures WHERE availability_open=true") == [{"id": 1}]
 
 
 def test_new_poll_update_preserves_closed_fixture_votes():
     engine = db()
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id IN (1,2)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (1,2)"))
     save_vote(engine, 1, [1, 2])
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id IN (1,2)"))
-        connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id IN (12,13)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id IN (1,2)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (12,13)"))
     save_vote(engine, 1, [12])
     assert rows(engine, "SELECT fixture_id FROM availability WHERE person_id=1 ORDER BY fixture_id") == [
         {"fixture_id": 1}, {"fixture_id": 2}, {"fixture_id": 12}
@@ -58,22 +59,82 @@ def test_new_poll_update_preserves_closed_fixture_votes():
 def test_editing_open_poll_only_adds_and_removes_open_choices():
     engine = db()
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id IN (1,2)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (1,2)"))
     save_vote(engine, 1, [1, 2])
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id=1"))
-        connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id=3"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id=1"))
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=3"))
     save_vote(engine, 1, [3])
     assert rows(engine, "SELECT fixture_id FROM availability WHERE person_id=1 ORDER BY fixture_id") == [
         {"fixture_id": 1}, {"fixture_id": 3}
     ]
+    events = rows(engine, "SELECT fixture_id,event_type FROM availability_events WHERE person_id=1 ORDER BY id")
+    assert events[-2:] == [{"fixture_id": 3, "event_type": "ADDED"}, {"fixture_id": 2, "event_type": "REMOVED"}]
+
+
+def test_frozen_poll_is_read_only_and_keeps_existing_selection():
+    engine = db()
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=1"))
+    save_vote(engine, 1, [1])
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id=1"))
+    save_vote(engine, 1, [])
+    assert rows(engine, "SELECT fixture_id FROM availability WHERE person_id=1") == [{"fixture_id": 1}]
+    assert rows(engine, "SELECT event_type FROM availability_events WHERE person_id=1") == [{"event_type": "ADDED"}]
+
+
+def test_latest_active_availability_drives_allocation():
+    engine = db()
+    malo = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (8,9,10)"))
+    save_vote(engine, malo, [8, 9, 10])
+    save_vote(engine, malo, [8, 10])
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id IN (8,9,10)"))
+    propose(engine)
+    assert availability_for_person(engine, malo, "FROZEN") == {8, 10}
+    assert not rows(engine, "SELECT 1 FROM assignments WHERE fixture_id=9 AND person_id=:person", {"person": malo})
+
+
+def test_device_token_recognition_and_change_person():
+    engine = db()
+    malo = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
+    token = remember_person(engine, malo)
+    assert len(token) >= 32
+    assert person_for_token(engine, token) == {"id": malo, "name": "Malo"}
+    assert "Malo" not in token
+    forget_person(engine, token)
+    assert person_for_token(engine, token) is None
+
+
+def test_returning_volunteer_ui_is_recognized_and_choices_prepopulate(monkeypatch, tmp_path):
+    path = tmp_path / "remembered.db"
+    engine = create_engine(f"sqlite:///{path.as_posix()}")
+    initialize(engine)
+    malo = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id IN (1,2)"))
+    save_vote(engine, malo, [1])
+    token = remember_person(engine, malo)
+    engine.dispose()
+    monkeypatch.setenv("SGIA_SQLITE_PATH", str(path))
+    page = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    page.query_params["device"] = token
+    page.run(timeout=20)
+    assert not list(page.exception)
+    assert any("Hi Malo" in getattr(item, "value", "") for item in page.markdown)
+    choices = {item.label: item.value for item in page.checkbox}
+    assert choices["Saturday - 11:00 AM"] is True
+    assert choices["Saturday - 3:00 PM"] is False
 
 
 def test_sqlite_and_postgres_schema_use_native_auto_generated_ids():
     assert schema_for("sqlite") == SQLITE_SCHEMA
     assert "INTEGER PRIMARY KEY AUTOINCREMENT" in SQLITE_SCHEMA
     assert schema_for("postgresql") == POSTGRES_SCHEMA
-    assert POSTGRES_SCHEMA.count("GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY") == 2
+    assert POSTGRES_SCHEMA.count("GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY") == 4
     assert "AUTOINCREMENT" not in POSTGRES_SCHEMA
 
 
@@ -88,7 +149,7 @@ def test_closed_poll_votes_can_still_be_allocated():
     engine = db()
     open_and_vote_all(engine, [1])
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id=1"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id=1"))
     propose(engine)
     assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"] == 3
 
@@ -123,7 +184,7 @@ def test_regenerate_changes_only_unconfirmed_and_preserves_confirmed_exactly():
     with engine.begin() as connection:
         connection.execute(text("UPDATE assignments SET confirmed=true WHERE fixture_id=:fixture_id AND role=:role"), confirmed)
         connection.execute(text("DELETE FROM availability WHERE fixture_id=:fixture AND person_id=:person"), {"fixture": unconfirmed["fixture_id"], "person": unconfirmed["person_id"]})
-        connection.execute(text("UPDATE fixtures SET availability_open=false WHERE id IN (1,2)"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='FROZEN' WHERE id IN (1,2)"))
     propose(engine, regenerate_unconfirmed=True)
     kept = rows(engine, "SELECT person_id,confirmed FROM assignments WHERE fixture_id=:fixture_id AND role=:role", confirmed)[0]
     refreshed = rows(engine, "SELECT person_id,confirmed FROM assignments WHERE fixture_id=:fixture_id AND role=:role", unconfirmed)[0]
@@ -249,3 +310,22 @@ def test_confirmed_allocation_message():
     assert "SGIA Umpires" in message
     assert "Umpire 1:" in message
     assert "Umpire 2:" in message
+
+
+def test_published_duty_withdrawal_requires_replacement():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    assignment = rows(engine, "SELECT fixture_id,role,person_id FROM assignments WHERE fixture_id=1 ORDER BY role LIMIT 1")[0]
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE assignments SET confirmed=true WHERE fixture_id=1"))
+        connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='PUBLISHED' WHERE id=1"))
+    assert withdraw_assignment(engine, assignment["fixture_id"], assignment["role"], assignment["person_id"])
+    assert rows(engine, "SELECT status FROM assignments WHERE fixture_id=:fixture_id AND role=:role", assignment) == [{"status": "REPLACEMENT_REQUIRED"}]
+    assert rows(engine, "SELECT event_type,person_id FROM assignment_events") == [{"event_type": "WITHDRAWN", "person_id": assignment["person_id"]}]
+    assert not withdraw_assignment(engine, assignment["fixture_id"], assignment["role"], assignment["person_id"])
+    replacement = suggest_replacement(engine, assignment["fixture_id"], assignment["role"])
+    assert replacement and replacement["id"] != assignment["person_id"]
+    assert rows(engine, "SELECT person_id,confirmed,status FROM assignments WHERE fixture_id=:fixture_id AND role=:role", assignment) == [
+        {"person_id": replacement["id"], "confirmed": 0, "status": "ASSIGNED"}
+    ]

@@ -30,8 +30,9 @@ Use the Supabase transaction-pooler or direct Postgres connection string. Escape
 - `src/db.py`: SQLAlchemy persistence and idempotent initialization
 - `src/allocation.py`: availability/eligibility-first explainable proposal engine
 - `src/board.py`: editable three-role allocation board and branded PNG export
+- `src/lifecycle.py`: remembered-device tokens, published duties, withdrawals, and replacements
 - `src/seed.py`: traceable fixture and people seed data
 - `schema.sql`: Postgres/Supabase schema
 - `tests/`: persistence, rules, updates, seed, and output checks
 
-Closing a poll only prevents further voting; its saved responses remain available for allocation. Each match supports Umpire 1, Umpire 2, and Scorer. Regenerating unconfirmed proposals deletes and recalculates only unconfirmed rows, while confirmed duties remain immutable. The final allocation board supports manual edits plus PNG, CSV, and WhatsApp-ready exports. Administrators remain responsible for reviewing and confirming all proposed allocations.
+Availability follows `OPEN → FROZEN → PUBLISHED`: open responses are editable and audited, frozen responses are read-only during allocation, and published confirmed duties are visible to remembered volunteers. A withdrawal creates a visible replacement-required assignment without silently regenerating confirmed work. Each match supports Umpire 1, Umpire 2, and Scorer. The final allocation board supports manual edits plus PNG, CSV, and WhatsApp-ready exports. Administrators remain responsible for reviewing and confirming all proposed allocations.

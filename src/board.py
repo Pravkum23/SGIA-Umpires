@@ -59,7 +59,7 @@ def save_allocation_board(engine, records):
                     INSERT INTO assignments(fixture_id,role,person_id,confirmed,reason)
                     VALUES(:fixture,:role,:person,true,'Admin allocation board')
                     ON CONFLICT(fixture_id,role) DO UPDATE SET
-                        person_id=:person,confirmed=true,reason='Admin allocation board'
+                        person_id=:person,confirmed=true,reason='Admin allocation board',status='ASSIGNED'
                 """), {"fixture": fixture_id, "role": role, "person": people[name]})
 
 

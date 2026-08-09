@@ -1,15 +1,18 @@
 import hashlib
 import hmac
+import json
 import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import text
 
 from src.allocation import allocation_message, propose
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import get_engine, initialize, rows, save_vote
+from src.lifecycle import forget_person, person_for_token, published_duties, remember_person, suggest_replacement, withdraw_assignment
 from src.routing import is_admin_request
 
 st.set_page_config(page_title="SGIA Umpires", page_icon="🏏", layout="wide")
@@ -34,6 +37,7 @@ div[data-testid="stCheckbox"] label p{color:var(--text);font-weight:600;font-siz
 .view-votes{background:var(--bubble-dark);border-top:1px solid var(--line);border-radius:0 0 15px 15px;text-align:center;color:#74d7c0;padding:11px;margin-bottom:13px;font-size:.86rem;box-shadow:0 7px 22px #0004}
 .stButton>button{border-radius:24px;background:var(--green);color:white;border:0;font-weight:800;letter-spacing:.035em;min-height:47px;box-shadow:0 5px 15px #0005}.stButton>button:hover{background:#06bd94;color:white}
 .submitted{background:#103c32;border:1px solid #278f77;border-radius:12px;padding:13px 15px;margin:4px 0 12px;color:#eafff9;font-size:.88rem}.submitted strong{display:block;color:#63e6be;font-size:.96rem;margin-bottom:2px}
+.identity{display:flex;justify-content:space-between;align-items:center;background:var(--bubble);padding:4px 16px 12px;color:var(--text)}.identity strong{font-size:1rem}.duty{background:#153b33;border:1px solid #356159;border-radius:12px;padding:13px 14px;margin:10px 0;color:var(--text)}.duty-status{color:#9de5d2;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
 div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border-radius:10px;color:var(--text)}
 @media(max-width:430px){.block-container{padding:12px 10px 28px!important}[data-testid="stImage"] img{width:78px!important;height:78px!important}.brand-title{font-size:1.28rem}.poll-head{padding:15px 14px 10px}.poll-name-label{padding-left:14px}.poll-row-meta{padding-left:41px;padding-right:11px}}
 </style>"""
@@ -70,46 +74,108 @@ def date_label(value):
     return f"{dt.strftime('%A')} - {dt.strftime('%I:%M %p').lstrip('0')}"
 
 
+def device_bridge(token_to_store=None, forget=False):
+    token_json = json.dumps(token_to_store)
+    forget_json = "true" if forget else "false"
+    components.html(f"""
+        <script>
+        const key = "sgia_device_token";
+        const supplied = {token_json};
+        const forget = {forget_json};
+        const parentUrl = new URL(window.parent.location.href);
+        if (forget) {{
+            localStorage.removeItem(key);
+            parentUrl.searchParams.delete("device");
+            window.parent.location.replace(parentUrl.toString());
+        }} else if (supplied) {{
+            localStorage.setItem(key, supplied);
+        }} else if (!parentUrl.searchParams.get("device")) {{
+            const remembered = localStorage.getItem(key);
+            if (remembered) {{
+                parentUrl.searchParams.set("device", remembered);
+                window.parent.location.replace(parentUrl.toString());
+            }}
+        }}
+        </script>
+    """, height=0)
+
+
 def render_public(db):
+    raw_token = st.query_params.get("device")
+    token = raw_token[0] if isinstance(raw_token, list) and raw_token else raw_token
+    remembered = person_for_token(db, token)
+    device_bridge()
     brand()
     people = rows(db, "SELECT id,name FROM people WHERE active=true ORDER BY name")
     st.markdown('<div class="poll-head"><div class="poll-question">Provide your availability for this weekend</div><div class="poll-instruction">Select one or more</div></div><div class="poll-name-label">Your Name</div>', unsafe_allow_html=True)
-    person_name = st.selectbox("Your Name", [p["name"] for p in people], index=None, placeholder="Select your name", label_visibility="collapsed")
-    if not person_name:
+    person = remembered
+    if remembered:
+        st.markdown(f'<div class="identity"><strong>Hi {remembered["name"]}</strong><span>Your saved profile</span></div>', unsafe_allow_html=True)
+        if st.button(f"Not {remembered['name']}? Change person", use_container_width=True):
+            forget_person(db, token)
+            device_bridge(forget=True)
+            st.stop()
+    else:
+        person_name = st.selectbox("Your Name", [p["name"] for p in people], index=None, placeholder="Select your name", label_visibility="collapsed")
+        if person_name:
+            person = next(p for p in people if p["name"] == person_name)
+            new_token = remember_person(db, person["id"])
+            device_bridge(token_to_store=new_token)
+    if not person:
         st.markdown('<div class="poll-message">Select your name to view the available slots.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
         return
-    person_id = next(p["id"] for p in people if p["name"] == person_name)
-    slots = rows(db, """
+    person_id = person["id"]
+    open_slots = rows(db, """
         SELECT f.*,COUNT(a.person_id) votes FROM fixtures f
         LEFT JOIN availability a ON a.fixture_id=f.id
-        WHERE f.availability_open=true GROUP BY f.id ORDER BY f.starts_at
+        WHERE f.poll_state='OPEN' GROUP BY f.id ORDER BY f.starts_at
     """)
+    frozen_slots = rows(db, """
+        SELECT f.*,COUNT(a.person_id) votes FROM fixtures f
+        LEFT JOIN availability a ON a.fixture_id=f.id
+        WHERE f.poll_state='FROZEN' GROUP BY f.id ORDER BY f.starts_at
+    """)
+    slots = open_slots or frozen_slots
+    poll_state = "OPEN" if open_slots else ("FROZEN" if frozen_slots else None)
     selected = {r["fixture_id"] for r in rows(db, "SELECT fixture_id FROM availability WHERE person_id=:person", {"person": person_id})}
     if not slots:
         st.markdown('<div class="poll-message">No availability poll is open right now.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
-        return
-    maximum = max([slot["votes"] for slot in slots] + [1])
-    choices = []
-    voter_details = []
-    for slot in slots:
-        checked = st.checkbox(date_label(slot["starts_at"]), value=slot["id"] in selected, key=f"slot_{person_id}_{slot['id']}")
-        if checked:
-            choices.append(slot["id"])
-        voters = rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:fixture ORDER BY p.name", {"fixture": slot["id"]})
-        initials = " ".join("".join(part[0] for part in v["name"].split()[:2]).upper() for v in voters[:4])
-        width = int(slot["votes"] * 100 / maximum)
-        st.markdown(f'<div class="poll-row-meta"><span class="secondary">{slot["home_team"]} vs {slot["away_team"]}</span><div class="vote-bar"><div class="vote-fill" style="width:{width}%"></div></div><span class="avatars">{initials}</span><b class="vote-count">{slot["votes"]}</b></div>', unsafe_allow_html=True)
-        voter_details.append((slot, voters))
-    st.markdown('<div class="view-votes">View votes</div>', unsafe_allow_html=True)
-    if st.session_state.pop("availability_saved", False):
-        st.markdown('<div class="submitted"><strong>✓ Availability submitted</strong>You can return and update your choices until the poll closes.</div>', unsafe_allow_html=True)
-    if st.button("SAVE MY AVAILABILITY", use_container_width=True, type="primary"):
-        save_vote(db, person_id, choices)
-        st.session_state.availability_saved = True
-        st.rerun()
-    with st.expander("View votes"):
-        for slot, voters in voter_details:
-            st.write(f"**{date_label(slot['starts_at'])}** — " + (", ".join(v["name"] for v in voters) or "No votes yet"))
+    else:
+        maximum = max([slot["votes"] for slot in slots] + [1])
+        choices, voter_details = [], []
+        for slot in slots:
+            checked = st.checkbox(date_label(slot["starts_at"]), value=slot["id"] in selected, key=f"slot_{person_id}_{slot['id']}", disabled=poll_state != "OPEN")
+            if checked:
+                choices.append(slot["id"])
+            voters = rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:fixture ORDER BY p.name", {"fixture": slot["id"]})
+            initials = " ".join("".join(part[0] for part in v["name"].split()[:2]).upper() for v in voters[:4])
+            width = int(slot["votes"] * 100 / maximum)
+            st.markdown(f'<div class="poll-row-meta"><span class="secondary">{slot["home_team"]} vs {slot["away_team"]}</span><div class="vote-bar"><div class="vote-fill" style="width:{width}%"></div></div><span class="avatars">{initials}</span><b class="vote-count">{slot["votes"]}</b></div>', unsafe_allow_html=True)
+            voter_details.append((slot, voters))
+        st.markdown('<div class="view-votes">View votes</div>', unsafe_allow_html=True)
+        if poll_state == "FROZEN":
+            st.info("Availability is frozen. Your selections are read-only while allocations are prepared.")
+        else:
+            if st.session_state.pop("availability_saved", False):
+                st.markdown('<div class="submitted"><strong>✓ Availability submitted</strong>You can return and update your choices until the poll closes.</div>', unsafe_allow_html=True)
+            label = "UPDATE MY AVAILABILITY" if selected & {slot["id"] for slot in slots} else "SAVE MY AVAILABILITY"
+            if st.button(label, use_container_width=True, type="primary"):
+                save_vote(db, person_id, choices)
+                st.session_state.availability_saved = True
+                st.rerun()
+        with st.expander("View votes"):
+            for slot, voters in voter_details:
+                st.write(f"**{date_label(slot['starts_at'])}** — " + (", ".join(v["name"] for v in voters) or "No votes yet"))
+
+    duties = published_duties(db, person_id)
+    if duties:
+        st.subheader("My Duties")
+        for duty in duties:
+            role_label = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}.get(duty["role"], duty["role"])
+            st.markdown(f'<div class="duty"><strong>{date_label(duty["starts_at"])}</strong><br>{duty["home_team"]} vs {duty["away_team"]}<br>Role: {role_label}<br><span class="duty-status">{duty["status"].replace("_", " ")}</span></div>', unsafe_allow_html=True)
+            if duty["status"] == "ASSIGNED" and st.button("I CAN'T ATTEND", key=f"withdraw_{duty['fixture_id']}_{duty['role']}", use_container_width=True):
+                withdraw_assignment(db, duty["fixture_id"], duty["role"], person_id)
+                st.rerun()
 
 
 def admin_authenticated():
@@ -141,18 +207,32 @@ def render_admin(db):
     control, allocation, board_tab, people_tab, output = st.tabs(["Open slots", "Allocations", "Allocation Board", "People", "Output"])
     with control:
         fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
+        state_counts = rows(db, "SELECT poll_state,COUNT(*) count FROM fixtures GROUP BY poll_state")
+        st.caption(" · ".join(f"{item['poll_state']}: {item['count']}" for item in state_counts))
+        freeze_col, publish_col = st.columns(2)
+        if freeze_col.button("Freeze Open Poll", use_container_width=True):
+            with db.begin() as connection:
+                connection.execute(text("UPDATE fixtures SET poll_state='FROZEN',availability_open=false WHERE poll_state='OPEN'"))
+            st.success("Open availability is now frozen.")
+            st.rerun()
+        if publish_col.button("Publish Frozen Allocation", use_container_width=True):
+            with db.begin() as connection:
+                connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED',availability_open=false WHERE poll_state='FROZEN'"))
+            st.success("Allocation published. Volunteers can now see their confirmed duties.")
+            st.rerun()
         opened = []
         for fixture in fixtures:
-            if st.checkbox(f"{pd.Timestamp(fixture['starts_at']).strftime('%a %d %b, %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']} ({fixture['responses']} available)", value=bool(fixture["availability_open"]), key=f"open_{fixture['id']}"):
+            locked = fixture["poll_state"] in ("FROZEN", "PUBLISHED")
+            if st.checkbox(f"[{fixture['poll_state']}] {pd.Timestamp(fixture['starts_at']).strftime('%a %d %b, %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']} ({fixture['responses']} available)", value=fixture["poll_state"] == "OPEN", key=f"open_{fixture['id']}", disabled=locked):
                 opened.append(fixture["id"])
             voters = rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:fixture ORDER BY p.name", {"fixture": fixture["id"]})
             if voters:
                 st.caption("Available: " + ", ".join(v["name"] for v in voters))
         if st.button("Update open slots"):
             with db.begin() as connection:
-                connection.execute(text("UPDATE fixtures SET availability_open=false"))
+                connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='CLOSED' WHERE poll_state='OPEN'"))
                 for fixture_id in opened:
-                    connection.execute(text("UPDATE fixtures SET availability_open=true WHERE id=:id"), {"id": fixture_id})
+                    connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=:id AND poll_state='CLOSED'"), {"id": fixture_id})
             st.success("Open slots updated")
             st.rerun()
     with allocation:
@@ -181,6 +261,32 @@ def render_admin(db):
                     st.rerun()
     with board_tab:
         st.subheader("Final Allocation Board")
+        replacements = rows(db, """
+            SELECT a.fixture_id,a.role,a.person_id,p.name,f.starts_at,f.home_team,f.away_team
+            FROM assignments a JOIN people p ON p.id=a.person_id JOIN fixtures f ON f.id=a.fixture_id
+            WHERE a.status='REPLACEMENT_REQUIRED' ORDER BY f.starts_at,a.role
+        """)
+        if replacements:
+            st.error(f"{len(replacements)} assignment(s) require replacement")
+            active_people = rows(db, "SELECT id,name FROM people WHERE active=true ORDER BY name")
+            for replacement in replacements:
+                with st.container(border=True):
+                    st.write(f"⚠️ **Replacement Required** — {date_label(replacement['starts_at'])} · {replacement['home_team']} vs {replacement['away_team']} · {replacement['role'].replace('_',' ').title()} ({replacement['name']} withdrew)")
+                    suggest_col, manual_col = st.columns(2)
+                    if suggest_col.button("Suggest Replacement", key=f"suggest_{replacement['fixture_id']}_{replacement['role']}"):
+                        candidate = suggest_replacement(db, replacement["fixture_id"], replacement["role"])
+                        if candidate:
+                            st.success(f"Suggested {candidate['name']}. Review and confirm below.")
+                            st.rerun()
+                        else:
+                            st.warning("No eligible available replacement found.")
+                    options = [person["name"] for person in active_people if person["id"] != replacement["person_id"]]
+                    manual = manual_col.selectbox("Manual replacement", options, key=f"manual_{replacement['fixture_id']}_{replacement['role']}")
+                    if manual_col.button("Assign Replacement", key=f"assign_replacement_{replacement['fixture_id']}_{replacement['role']}"):
+                        person_id = next(person["id"] for person in active_people if person["name"] == manual)
+                        with db.begin() as connection:
+                            connection.execute(text("UPDATE assignments SET person_id=:person,status='ASSIGNED',confirmed=true,reason='Manual replacement' WHERE fixture_id=:fixture AND role=:role"), {"person": person_id, "fixture": replacement["fixture_id"], "role": replacement["role"]})
+                        st.rerun()
         board_rows = allocation_board(db)
         if not board_rows:
             st.info("Generate proposed allocations first to populate the board.")
