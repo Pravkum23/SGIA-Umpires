@@ -1,0 +1,1 @@
+import {NextResponse} from "next/server";import {session} from "@/lib/auth";import {getDuties} from "@/lib/duties";export async function GET(){const me=await session();if(!me)return NextResponse.json({error:"Unauthorized"},{status:401});return NextResponse.json({duties:await getDuties(me.id)})}

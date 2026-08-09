@@ -45,6 +45,7 @@ div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border
 
 ADMIN_CSS = """<style>
 .block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}
+@media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}}
 </style>"""
 
 st.markdown(ADMIN_CSS if ADMIN_MODE else PUBLIC_CSS, unsafe_allow_html=True)
@@ -216,7 +217,70 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
-    control, fixtures_tab, allocation, board_tab, people_tab, history_tab, output = st.tabs(["Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "History", "Output"])
+    quick_tab, control, fixtures_tab, allocation, board_tab, people_tab, history_tab, output = st.tabs(["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "History", "Output"])
+    with quick_tab:
+        st.subheader("Quick Admin")
+        upcoming = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP")[0]["count"]
+        open_count = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE poll_state='OPEN'")[0]["count"]
+        responses = rows(db, "SELECT COUNT(DISTINCT person_id) count FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.poll_state IN ('OPEN','FROZEN')")[0]["count"]
+        required = rows(db, "SELECT COUNT(*) count FROM assignments WHERE status='REPLACEMENT_REQUIRED'")[0]["count"]
+        cards = st.columns(2)
+        for index, (value, label) in enumerate(((upcoming,"Upcoming Matches"),(open_count,"Open Poll"),(responses,"Responses"),(required,"Replacement Required"))):
+            cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
+        st.markdown("#### Quick actions")
+        qa1, qa2 = st.columns(2)
+        if qa1.button("FREEZE POLL", key="quick_freeze"):
+            with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state='FROZEN',availability_open=false WHERE poll_state='OPEN'"))
+            st.rerun()
+        if qa2.button("GENERATE ALLOCATION", key="quick_generate"):
+            propose(db, regenerate_unconfirmed=True); st.rerun()
+        st.markdown("#### + Add match")
+        q_date = st.text_input("Date", placeholder="22-Aug-2026", key="quick_date")
+        q_time = st.text_input("Time", placeholder="7:00 PM", key="quick_time")
+        q_team1 = st.text_input("TEAM 1", key="quick_team1")
+        q_team2 = st.text_input("TEAM 2", key="quick_team2")
+        q_add, q_open = st.columns(2)
+        def quick_add(open_poll=False):
+            if add_fixture(db,q_date,q_time,q_team1,q_team2):
+                if open_poll:
+                    with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE home_team=:home AND away_team=:away AND poll_state='CLOSED'"),{"home":q_team1.strip(),"away":q_team2.strip()})
+                st.success("Match added" + (" and poll opened." if open_poll else ".")); st.rerun()
+            else: st.warning("Duplicate fixture was not added.")
+        if q_add.button("ADD MATCH", key="quick_add"):
+            try: quick_add(False)
+            except ValueError as error: st.error(str(error))
+        if q_open.button("ADD & OPEN POLL", key="quick_add_open"):
+            try: quick_add(True)
+            except ValueError as error: st.error(str(error))
+        st.markdown("#### Matches")
+        mobile_fixtures = rows(db,"SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id WHERE f.starts_at>=CURRENT_TIMESTAMP GROUP BY f.id ORDER BY f.starts_at LIMIT 12")
+        for fixture in mobile_fixtures:
+            with st.expander(f"{pd.Timestamp(fixture['starts_at']).strftime('%a %d %b · %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']}"):
+                st.write(f"**{fixture['poll_state']}** · {fixture['responses']} available")
+                action_cols=st.columns(4)
+                for idx,(label,state) in enumerate((("Open","OPEN"),("Close","CLOSED"),("Freeze","FROZEN"),("Publish","PUBLISHED"))):
+                    if action_cols[idx].button(label,key=f"mobile_state_{fixture['id']}_{state}"):
+                        with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state=:state,availability_open=:opened WHERE id=:id"),{"state":state,"opened":state=="OPEN","id":fixture["id"]})
+                        st.rerun()
+        st.markdown("#### Final allocation")
+        quick_board = allocation_board(db)
+        active_names = [person["name"] for person in rows(db,"SELECT name FROM people WHERE active=true ORDER BY name")]
+        for match in quick_board:
+            with st.container(border=True):
+                st.write(f"**{match['Day']} · {match['Time']}**")
+                st.caption(f"{match['TEAM 1']} vs {match['TEAM 2']}")
+                edited_match = dict(match)
+                for role in ("Umpire 1","Umpire 2","Scorer"):
+                    current = match[role] if match[role] in active_names else active_names[0]
+                    edited_match[role] = st.selectbox(role,active_names,index=active_names.index(current),key=f"quick_{match['fixture_id']}_{role}")
+                if st.button("SAVE",key=f"quick_save_{match['fixture_id']}"):
+                    save_allocation_board(db,[edited_match]);st.success("Assignment saved.");st.rerun()
+        if quick_board:
+            quick_png=allocation_board_png(quick_board,"assets/sgia-logo.png")
+            st.image(quick_png,use_container_width=True)
+            st.download_button("DOWNLOAD PNG",quick_png,"sgia-official-allocation.png","image/png",key="quick_png")
+            st.download_button("DOWNLOAD CSV",pd.DataFrame(quick_board)[BOARD_COLUMNS].to_csv(index=False),"sgia-allocation.csv","text/csv",key="quick_csv")
+            st.text_area("COPY WHATSAPP MESSAGE",allocation_message(db),height=220,key="quick_whatsapp")
     with control:
         fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
         state_counts = rows(db, "SELECT poll_state,COUNT(*) count FROM fixtures GROUP BY poll_state")

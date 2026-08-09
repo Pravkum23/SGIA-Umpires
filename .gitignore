@@ -5,4 +5,7 @@ __pycache__/
 .streamlit/secrets.toml
 *.db
 .env
-
+pwa/node_modules/
+pwa/.next/
+pwa/.env*.local
+pwa/*.tsbuildinfo

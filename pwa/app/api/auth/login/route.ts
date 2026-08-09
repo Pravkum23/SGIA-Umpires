@@ -1,0 +1,2 @@
+import {NextResponse} from "next/server";import {login,setCookie} from "@/lib/auth";
+export async function POST(req:Request){const {personId,pin}=await req.json();if(!Number.isInteger(personId)||!/^[0-9]{4}$/.test(pin||""))return NextResponse.json({error:"Invalid credentials"},{status:400});const result=await login(personId,pin);if(!result.ok)return NextResponse.json({error:result.code},{status:result.code==="LOCKED"?429:401});await setCookie(result.token!);return NextResponse.json({person:result.person})}

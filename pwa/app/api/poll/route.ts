@@ -1,0 +1,1 @@
+import {NextResponse} from "next/server";import {session} from "@/lib/auth";import {getPoll} from "@/lib/poll";export async function GET(){const me=await session();if(!me)return NextResponse.json({error:"Unauthorized"},{status:401});return NextResponse.json(await getPoll(me.id))}
