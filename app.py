@@ -12,7 +12,8 @@ from sqlalchemy import text
 from src.allocation import allocation_message, propose
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import get_engine, initialize, rows, save_vote
-from src.lifecycle import forget_person, person_for_token, published_duties, remember_person, suggest_replacement, withdraw_assignment
+from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
+from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
 from src.routing import is_admin_request
 
 st.set_page_config(page_title="SGIA Umpires", page_icon="🏏", layout="wide")
@@ -110,6 +111,7 @@ def render_public(db):
     st.markdown('<div class="poll-head"><div class="poll-question">Provide your availability for this weekend</div><div class="poll-instruction">Select one or more</div></div><div class="poll-name-label">Your Name</div>', unsafe_allow_html=True)
     person = remembered
     if remembered:
+        device_bridge(token_to_store=token)
         st.markdown(f'<div class="identity"><strong>Hi {remembered["name"]}</strong><span>Your saved profile</span></div>', unsafe_allow_html=True)
         if st.button(f"Not {remembered['name']}? Change person", use_container_width=True):
             forget_person(db, token)
@@ -118,9 +120,19 @@ def render_public(db):
     else:
         person_name = st.selectbox("Your Name", [p["name"] for p in people], index=None, placeholder="Select your name", label_visibility="collapsed")
         if person_name:
-            person = next(p for p in people if p["name"] == person_name)
-            new_token = remember_person(db, person["id"])
-            device_bridge(token_to_store=new_token)
+            selected_person = next(p for p in people if p["name"] == person_name)
+            pin = st.text_input("Your 4-digit PIN", type="password", max_chars=4, placeholder="Enter PIN")
+            if not pin_status(db, selected_person["id"]):
+                st.warning("Your PIN has not been set. Please contact the SGIA administrator.")
+            elif st.button("CONTINUE", use_container_width=True, type="primary"):
+                new_token, result = authenticate_person(db, selected_person["id"], pin)
+                if new_token:
+                    st.query_params["device"] = new_token
+                    st.rerun()
+                elif result == "LOCKED":
+                    st.error("Too many failed attempts. Please try again in 15 minutes.")
+                else:
+                    st.error("Incorrect PIN.")
     if not person:
         st.markdown('<div class="poll-message">Select your name to view the available slots.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
         return
@@ -204,7 +216,7 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
-    control, allocation, board_tab, people_tab, output = st.tabs(["Open slots", "Allocations", "Allocation Board", "People", "Output"])
+    control, fixtures_tab, allocation, board_tab, people_tab, history_tab, output = st.tabs(["Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "History", "Output"])
     with control:
         fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
         state_counts = rows(db, "SELECT poll_state,COUNT(*) count FROM fixtures GROUP BY poll_state")
@@ -235,6 +247,52 @@ def render_admin(db):
                     connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=:id AND poll_state='CLOSED'"), {"id": fixture_id})
             st.success("Open slots updated")
             st.rerun()
+    with fixtures_tab:
+        st.subheader("Fixture Manager")
+        add_section, edit_section, bulk_section = st.tabs(["Add Fixture", "Edit Fixture", "Bulk Import"])
+        with add_section:
+            add_date = st.text_input("Date", placeholder="22-Aug-2026", key="fixture_add_date")
+            add_time = st.text_input("Time", placeholder="11:00 AM", key="fixture_add_time")
+            add_team_1 = st.text_input("TEAM 1", key="fixture_add_team_1")
+            add_team_2 = st.text_input("TEAM 2", key="fixture_add_team_2")
+            if st.button("Add Fixture"):
+                try:
+                    if add_fixture(db, add_date, add_time, add_team_1, add_team_2):
+                        st.success("Fixture added.")
+                    else:
+                        st.warning("Duplicate fixture was not added.")
+                except ValueError as error:
+                    st.error(str(error))
+        with edit_section:
+            fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures ORDER BY starts_at")
+            fixture_labels = {f"{pd.Timestamp(item['starts_at']).strftime('%d-%b-%Y %I:%M %p')} · {item['home_team']} vs {item['away_team']}": item for item in fixture_options}
+            selected_label = st.selectbox("Fixture", list(fixture_labels), key="fixture_edit_select")
+            if selected_label:
+                selected_fixture = fixture_labels[selected_label]
+                starts = pd.Timestamp(selected_fixture["starts_at"])
+                edit_date = st.text_input("Date", starts.strftime("%d-%b-%Y"), key="fixture_edit_date")
+                edit_time = st.text_input("Time", starts.strftime("%I:%M %p").lstrip("0"), key="fixture_edit_time")
+                edit_team_1 = st.text_input("TEAM 1", selected_fixture["home_team"], key="fixture_edit_team_1")
+                edit_team_2 = st.text_input("TEAM 2", selected_fixture["away_team"], key="fixture_edit_team_2")
+                if st.button("Save Fixture Changes"):
+                    try:
+                        edit_fixture(db, selected_fixture["id"], edit_date, edit_time, edit_team_1, edit_team_2)
+                        st.success("Fixture updated.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error(f"Fixture could not be updated: {error}")
+        with bulk_section:
+            bulk_text = st.text_area("Paste fixtures", placeholder="Day | Date | Time | TEAM 1 | TEAM 2\nSaturday | 05-Sep-2026 | 11:00 AM | Team A | Team B", height=180)
+            if st.button("Preview Bulk Import"):
+                st.session_state.fixture_preview = preview_bulk_fixtures(db, bulk_text)
+            fixture_preview = st.session_state.get("fixture_preview", [])
+            if fixture_preview:
+                st.dataframe(pd.DataFrame([{key: value for key, value in item.items() if key != "starts_at"} for item in fixture_preview]), hide_index=True, use_container_width=True)
+                if st.button("Import Ready Fixtures"):
+                    imported = import_bulk_fixtures(db, fixture_preview)
+                    st.success(f"Imported {imported} fixture(s). Duplicates and invalid rows were skipped.")
+                    st.session_state.fixture_preview = []
+                    st.rerun()
     with allocation:
         left, right = st.columns(2)
         if left.button("Generate proposed allocation", use_container_width=True):
@@ -256,8 +314,7 @@ def render_admin(db):
                 st.caption(("Confirmed · " if assignment["confirmed"] else "Proposed · ") + (assignment["reason"] or "Manual selection"))
                 if not assignment["confirmed"] and st.button("Save & confirm", key=f"confirm_{assignment['fixture_id']}_{assignment['role']}"):
                     chosen = next(p["id"] for p in eligible if p["name"] == choice)
-                    with db.begin() as connection:
-                        connection.execute(text("UPDATE assignments SET person_id=:person,confirmed=true,reason='Admin confirmed' WHERE fixture_id=:fixture AND role=:role"), {"person": chosen, "fixture": assignment["fixture_id"], "role": assignment["role"]})
+                    confirm_assignment(db, assignment["fixture_id"], assignment["role"], chosen)
                     st.rerun()
     with board_tab:
         st.subheader("Final Allocation Board")
@@ -284,8 +341,7 @@ def render_admin(db):
                     manual = manual_col.selectbox("Manual replacement", options, key=f"manual_{replacement['fixture_id']}_{replacement['role']}")
                     if manual_col.button("Assign Replacement", key=f"assign_replacement_{replacement['fixture_id']}_{replacement['role']}"):
                         person_id = next(person["id"] for person in active_people if person["name"] == manual)
-                        with db.begin() as connection:
-                            connection.execute(text("UPDATE assignments SET person_id=:person,status='ASSIGNED',confirmed=true,reason='Manual replacement' WHERE fixture_id=:fixture AND role=:role"), {"person": person_id, "fixture": replacement["fixture_id"], "role": replacement["role"]})
+                        replace_assignment(db, replacement["fixture_id"], replacement["role"], person_id)
                         st.rerun()
         board_rows = allocation_board(db)
         if not board_rows:
@@ -317,8 +373,8 @@ def render_admin(db):
             st.download_button("Download PNG", png, "sgia-official-allocation.png", "image/png")
             st.download_button("Download Board CSV", edited_board[BOARD_COLUMNS].to_csv(index=False), "sgia-allocation-board.csv", "text/csv")
     with people_tab:
-        roster = rows(db, "SELECT * FROM people ORDER BY name")
-        edited = st.data_editor(pd.DataFrame(roster), disabled=["id"], hide_index=True, num_rows="dynamic")
+        roster = rows(db, "SELECT id,name,can_umpire,can_score,preferred_role,active,CASE WHEN pin_hash IS NULL THEN 'NOT SET' ELSE 'SET' END pin_status FROM people ORDER BY name")
+        edited = st.data_editor(pd.DataFrame(roster), disabled=["id", "pin_status"], hide_index=True, num_rows="dynamic")
         if st.button("Save people"):
             with db.begin() as connection:
                 for _, person in edited.iterrows():
@@ -330,9 +386,45 @@ def render_admin(db):
                         connection.execute(text("UPDATE people SET name=:name,can_umpire=:umpire,can_score=:score,preferred_role=:preferred,active=:active WHERE id=:id"), values)
             st.success("People saved")
             st.rerun()
+        st.subheader("Personal PIN")
+        pin_people = rows(db, "SELECT id,name,CASE WHEN pin_hash IS NULL THEN 'NOT SET' ELSE 'SET' END pin_status FROM people WHERE active=true ORDER BY name")
+        pin_names = [f"{person['name']} · {person['pin_status']}" for person in pin_people]
+        pin_selection = st.selectbox("Volunteer", pin_names, key="pin_person")
+        new_pin = st.text_input("New 4-digit PIN", type="password", max_chars=4, key="new_person_pin")
+        revoke = st.checkbox("Revoke remembered devices", value=True, key="revoke_person_devices")
+        if st.button("Set / Reset PIN"):
+            person = pin_people[pin_names.index(pin_selection)]
+            try:
+                set_person_pin(db, person["id"], new_pin, revoke_tokens=revoke)
+                st.success("PIN securely updated. The plaintext PIN was not stored.")
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
         workload = rows(db, "SELECT p.name,SUM(CASE WHEN a.role IN ('umpire_1','umpire_2') THEN 1 ELSE 0 END) umpiring,SUM(CASE WHEN a.role='scorer' THEN 1 ELSE 0 END) scoring,COUNT(a.role) total,MAX(f.starts_at) last_duty FROM people p LEFT JOIN assignments a ON a.person_id=p.id LEFT JOIN fixtures f ON f.id=a.fixture_id GROUP BY p.id,p.name ORDER BY total,p.name")
         st.subheader("Workload")
         st.dataframe(workload, use_container_width=True, hide_index=True)
+    with history_tab:
+        st.subheader("Assignment History")
+        history = assignment_history(db)
+        if not history:
+            st.info("No assignment events recorded yet.")
+        else:
+            people_filter = ["All"] + sorted({item["person"] for item in history} | {item["replacement"] for item in history if item["replacement"]})
+            action_filter = ["All"] + sorted({item["action"] for item in history})
+            filter_person = st.selectbox("Person", people_filter, key="history_person")
+            filter_action = st.selectbox("Action", action_filter, key="history_action")
+            filter_date = st.date_input("Date", value=None, key="history_date")
+            display = []
+            for item in history:
+                starts = pd.Timestamp(item["starts_at"])
+                if filter_person != "All" and filter_person not in (item["person"], item["replacement"]):
+                    continue
+                if filter_action != "All" and item["action"] != filter_action:
+                    continue
+                if filter_date and starts.date() != filter_date:
+                    continue
+                display.append({"Date": starts.strftime("%d-%b-%Y"), "Time": starts.strftime("%I:%M %p").lstrip("0"), "Match": f"{item['home_team']} vs {item['away_team']}", "Role": item["role"].replace("_", " ").title(), "Person": item["person"], "Action": item["action"], "Replacement": item["replacement"] or "", "Reason": item["reason"] or "", "Timestamp": item["created_at"]})
+            st.dataframe(pd.DataFrame(display), hide_index=True, use_container_width=True)
     with output:
         message = allocation_message(db)
         st.text_area("Copy-ready allocation", message, height=360)

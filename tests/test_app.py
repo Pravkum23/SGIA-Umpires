@@ -6,7 +6,8 @@ from streamlit.testing.v1 import AppTest
 from src.allocation import allocation_message, propose
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
-from src.lifecycle import availability_for_person, forget_person, person_for_token, remember_person, suggest_replacement, withdraw_assignment
+from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
+from src.lifecycle import authenticate_person, availability_for_person, forget_person, person_for_token, remember_person, replace_assignment, set_person_pin, suggest_replacement, verify_person_pin, withdraw_assignment
 from src.routing import is_admin_request
 
 
@@ -107,6 +108,29 @@ def test_device_token_recognition_and_change_person():
     assert "Malo" not in token
     forget_person(engine, token)
     assert person_for_token(engine, token) is None
+
+
+def test_wrong_pin_rejected_and_correct_pin_creates_device_token():
+    engine = db()
+    malo = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
+    set_person_pin(engine, malo, "4821")
+    token, result = authenticate_person(engine, malo, "1111")
+    assert token is None and result == "INVALID"
+    token, result = authenticate_person(engine, malo, "4821")
+    assert result == "OK" and token
+    assert person_for_token(engine, token) == {"id": malo, "name": "Malo"}
+    stored = rows(engine, "SELECT pin_hash FROM people WHERE id=:person", {"person": malo})[0]["pin_hash"]
+    assert "4821" not in stored and stored.startswith("pbkdf2_sha256$")
+
+
+def test_pin_reset_revokes_existing_device_token():
+    engine = db()
+    malo = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
+    set_person_pin(engine, malo, "4821")
+    token, _ = authenticate_person(engine, malo, "4821")
+    set_person_pin(engine, malo, "7319", revoke_tokens=True)
+    assert person_for_token(engine, token) is None
+    assert verify_person_pin(engine, malo, "7319") == (True, "OK")
 
 
 def test_returning_volunteer_ui_is_recognized_and_choices_prepopulate(monkeypatch, tmp_path):
@@ -247,6 +271,9 @@ def test_allocation_board_columns_and_manual_save():
         WHERE a.fixture_id=1 AND a.role='umpire_1'
     """)[0]
     assert saved == {"name": replacement, "confirmed": 1, "reason": "Admin allocation board"}
+    audit = rows(engine, "SELECT event_type,person_id,replacement_person_id FROM assignment_events WHERE fixture_id=1 AND role='umpire_1'")
+    assert audit[-1] == {"event_type": "MANUAL_CHANGE", "person_id": next(row["id"] for row in rows(engine, "SELECT id,name FROM people") if row["name"] == original), "replacement_person_id": next(row["id"] for row in rows(engine, "SELECT id,name FROM people") if row["name"] == replacement)}
+    assert rows(engine, "SELECT COUNT(*) n FROM assignment_events WHERE event_type='CONFIRMED'")[0]["n"] == 2
 
 
 def test_allocation_board_png_export():
@@ -298,6 +325,12 @@ def test_admin_query_route_still_renders_login(monkeypatch, tmp_path):
     page.run(timeout=20)
     assert not list(page.exception)
     assert any(item.label == "Admin PIN" for item in page.text_input)
+    next(item for item in page.text_input if item.label == "Admin PIN").set_value("test-only-pin")
+    next(item for item in page.button if item.label == "Sign in").click()
+    page.run(timeout=20)
+    assert not list(page.exception)
+    labels = {tab.label for tab in page.tabs}
+    assert {"Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "History", "Output"} <= labels
 
 
 def test_confirmed_allocation_message():
@@ -329,3 +362,54 @@ def test_published_duty_withdrawal_requires_replacement():
     assert rows(engine, "SELECT person_id,confirmed,status FROM assignments WHERE fixture_id=:fixture_id AND role=:role", assignment) == [
         {"person_id": replacement["id"], "confirmed": 0, "status": "ASSIGNED"}
     ]
+    events = rows(engine, "SELECT event_type,person_id,replacement_person_id FROM assignment_events ORDER BY id")
+    assert events[0]["event_type"] == "WITHDRAWN"
+    assert events[1] == {"event_type": "REPLACED", "person_id": assignment["person_id"], "replacement_person_id": replacement["id"]}
+
+
+def test_manual_replacement_records_replaced_event():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    assignment = rows(engine, "SELECT fixture_id,role,person_id FROM assignments WHERE fixture_id=1 ORDER BY role LIMIT 1")[0]
+    replacement = rows(engine, "SELECT id FROM people WHERE active=true AND id<>:person ORDER BY id LIMIT 1", {"person": assignment["person_id"]})[0]["id"]
+    replace_assignment(engine, assignment["fixture_id"], assignment["role"], replacement)
+    assert rows(engine, "SELECT event_type,person_id,replacement_person_id FROM assignment_events") == [
+        {"event_type": "REPLACED", "person_id": assignment["person_id"], "replacement_person_id": replacement}
+    ]
+
+
+def test_fixture_add_edit_and_duplicate_safe_bulk_import():
+    engine = db()
+    assert add_fixture(engine, "05-Sep-2026", "11:00 AM", "Team A", "Team B")
+    assert not add_fixture(engine, "05-Sep-2026", "11:00 AM", "Duplicate", "Ignored")
+    fixture = rows(engine, "SELECT id FROM fixtures WHERE home_team='Team A'")[0]
+    assert edit_fixture(engine, fixture["id"], "05-Sep-2026", "12:00 PM", "Team Alpha", "Team Beta")
+    edited = rows(engine, "SELECT home_team,away_team FROM fixtures WHERE id=:id", fixture)[0]
+    assert edited == {"home_team": "Team Alpha", "away_team": "Team Beta"}
+    pasted = """Day | Date | Time | TEAM 1 | TEAM 2
+Saturday | 05-Sep-2026 | 12:00 PM | Duplicate | Existing
+Sunday | 06-Sep-2026 | 3:00 PM | Team C | Team D
+Sunday | 06-Sep-2026 | 3:00 PM | Duplicate In Paste | Team E"""
+    preview = preview_bulk_fixtures(engine, pasted)
+    assert [item["Status"] for item in preview] == ["DUPLICATE", "READY", "DUPLICATE"]
+    assert import_bulk_fixtures(engine, preview) == 1
+    assert import_bulk_fixtures(engine, preview) == 0
+
+
+def test_existing_schema_migration_preserves_data():
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE people (id INTEGER PRIMARY KEY, name VARCHAR(80) UNIQUE NOT NULL, can_umpire BOOLEAN NOT NULL, can_score BOOLEAN NOT NULL, preferred_role VARCHAR(10) NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE)"))
+        connection.execute(text("CREATE TABLE fixtures (id INTEGER PRIMARY KEY, starts_at TIMESTAMP UNIQUE NOT NULL, home_team VARCHAR(100) NOT NULL, away_team VARCHAR(100) NOT NULL, availability_open BOOLEAN NOT NULL DEFAULT FALSE)"))
+        connection.execute(text("CREATE TABLE availability (person_id INTEGER NOT NULL, fixture_id INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(person_id,fixture_id))"))
+        connection.execute(text("CREATE TABLE assignments (fixture_id INTEGER NOT NULL, role VARCHAR(10) NOT NULL, person_id INTEGER NOT NULL, confirmed BOOLEAN NOT NULL DEFAULT FALSE, reason TEXT, PRIMARY KEY(fixture_id,role))"))
+        connection.execute(text("INSERT INTO people VALUES(100,'Legacy Person',true,true,'Either',true)"))
+        connection.execute(text("INSERT INTO fixtures VALUES(100,'2026-09-20 10:00:00','Legacy A','Legacy B',true)"))
+        connection.execute(text("INSERT INTO availability(person_id,fixture_id) VALUES(100,100)"))
+        connection.execute(text("INSERT INTO assignments VALUES(100,'umpire',100,true,'Legacy assignment')"))
+    initialize(engine)
+    assert rows(engine, "SELECT name,pin_hash FROM people WHERE id=100") == [{"name": "Legacy Person", "pin_hash": None}]
+    assert rows(engine, "SELECT poll_state FROM fixtures WHERE id=100") == [{"poll_state": "OPEN"}]
+    assert rows(engine, "SELECT person_id,fixture_id FROM availability WHERE person_id=100") == [{"person_id": 100, "fixture_id": 100}]
+    assert rows(engine, "SELECT role,status,person_id FROM assignments WHERE fixture_id=100") == [{"role": "umpire_1", "status": "ASSIGNED", "person_id": 100}]

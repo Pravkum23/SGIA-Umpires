@@ -50,7 +50,10 @@ def save_allocation_board(engine, records):
             fixture_id = int(record["fixture_id"])
             for role, column in ROLE_COLUMNS.items():
                 name = str(record.get(column, "") or "").strip()
+                existing = connection.execute(text("SELECT person_id,confirmed FROM assignments WHERE fixture_id=:fixture AND role=:role"), {"fixture": fixture_id, "role": role}).mappings().first()
                 if not name:
+                    if existing:
+                        connection.execute(text("INSERT INTO assignment_events(fixture_id,role,person_id,event_type,reason) VALUES(:fixture,:role,:person,'MANUAL_CHANGE','Cleared on allocation board')"), {"fixture": fixture_id, "role": role, "person": existing.person_id})
                     connection.execute(text("DELETE FROM assignments WHERE fixture_id=:fixture AND role=:role"), {"fixture": fixture_id, "role": role})
                     continue
                 if name not in people:
@@ -61,6 +64,14 @@ def save_allocation_board(engine, records):
                     ON CONFLICT(fixture_id,role) DO UPDATE SET
                         person_id=:person,confirmed=true,reason='Admin allocation board',status='ASSIGNED'
                 """), {"fixture": fixture_id, "role": role, "person": people[name]})
+                new_person = people[name]
+                if existing and existing.person_id != new_person:
+                    connection.execute(text("""
+                        INSERT INTO assignment_events(fixture_id,role,person_id,replacement_person_id,event_type,reason)
+                        VALUES(:fixture,:role,:previous,:replacement,'MANUAL_CHANGE','Allocation board edit')
+                    """), {"fixture": fixture_id, "role": role, "previous": existing.person_id, "replacement": new_person})
+                elif not existing or not existing.confirmed:
+                    connection.execute(text("INSERT INTO assignment_events(fixture_id,role,person_id,event_type,reason) VALUES(:fixture,:role,:person,'CONFIRMED','Allocation board confirmation')"), {"fixture": fixture_id, "role": role, "person": new_person})
 
 
 def _font(size, bold=False):
