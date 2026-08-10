@@ -1,4 +1,5 @@
 import "server-only";
+import crypto from "node:crypto";
 import { pool, transaction } from "./db";
 import { formatFixtureDate, formatFixtureDay, singaporeTimestampSql } from "./sgia-time";
 
@@ -35,6 +36,10 @@ export async function saveAvailability(personId: number, fixtureIds: number[]) {
     }
     for (const id of before) {
       if (!wanted.has(id)) await db.query("INSERT INTO availability_events(person_id,fixture_id,event_type) VALUES($1,$2,'REMOVED')", [personId, id]);
+    }
+    if (allowed.size) {
+      const key = crypto.createHash("sha256").update([...allowed].sort((a, b) => a - b).join(",")).digest("hex");
+      await db.query("INSERT INTO poll_submissions(person_id,poll_key) VALUES($1,$2) ON CONFLICT(person_id,poll_key) DO UPDATE SET updated_at=CURRENT_TIMESTAMP", [personId, key]);
     }
     return [...wanted];
   });

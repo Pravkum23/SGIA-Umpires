@@ -8,6 +8,7 @@ from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, sav
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import authenticate_person, availability_for_person, forget_person, person_for_token, remember_person, replace_assignment, set_person_pin, suggest_replacement, verify_person_pin, withdraw_assignment
+from src.live_poll import coverage_status, live_poll_monitor
 from src.routing import is_admin_request
 from src.workload import fixture_history, season_workload, set_match_status
 
@@ -416,6 +417,7 @@ def test_existing_schema_migration_preserves_data():
     assert rows(engine, "SELECT role,status,person_id FROM assignments WHERE fixture_id=100") == [{"role": "umpire_1", "status": "ASSIGNED", "person_id": 100}]
     assert rows(engine, "SELECT match_status FROM fixtures WHERE id=100") == [{"match_status": "SCHEDULED"}]
     assert rows(engine, "SELECT COUNT(*) n FROM fixture_events")[0]["n"] == 0
+    assert rows(engine, "SELECT COUNT(*) n FROM poll_submissions WHERE person_id=100")[0]["n"] == 1
 
 
 def test_match_status_migration_is_idempotent_and_defaults_scheduled():
@@ -518,3 +520,90 @@ def test_allocator_uses_lower_season_workload_only_as_tiebreaker():
     chosen = rows(engine, "SELECT person_id,reason FROM assignments WHERE fixture_id=1 AND role='umpire_1'")[0]
     assert chosen["person_id"] == low
     assert "season workload" in chosen["reason"].lower()
+
+
+def test_live_poll_counts_active_zero_selection_response_and_nonresponders():
+    engine = db()
+    person = rows(engine, "SELECT id,name FROM people WHERE active=true ORDER BY name LIMIT 1")[0]
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE id IN (1,2)"))
+    save_vote(engine, person["id"], [])
+    monitor = live_poll_monitor(engine)
+    assert monitor["active_volunteers"] == 16
+    assert monitor["responded"] == 1
+    assert monitor["open_matches"] == 2
+    assert person["name"] not in monitor["yet_to_respond"]
+    assert len(monitor["yet_to_respond"]) == 15
+    assert rows(engine, "SELECT COUNT(*) n FROM availability WHERE person_id=:person", {"person": person["id"]})[0]["n"] == 0
+
+
+def test_live_poll_updated_submission_remains_one_respondent():
+    engine = db()
+    person = rows(engine, "SELECT id FROM people WHERE active=true ORDER BY id LIMIT 1")[0]
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE id IN (1,2)"))
+    save_vote(engine, person["id"], [1])
+    save_vote(engine, person["id"], [2])
+    assert live_poll_monitor(engine)["responded"] == 1
+    assert rows(engine, "SELECT COUNT(*) n FROM poll_submissions WHERE person_id=:id", person)[0]["n"] == 1
+
+
+def test_live_poll_day_and_match_unique_availability_capabilities():
+    engine = db()
+    people = rows(engine, "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY id LIMIT 3")
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE id IN (1,2)"))
+    save_vote(engine, people[0]["id"], [1, 2])
+    save_vote(engine, people[1]["id"], [1])
+    save_vote(engine, people[2]["id"], [1])
+    monitor = live_poll_monitor(engine)
+    assert len(monitor["days"]) == 1
+    day = monitor["days"][0]
+    assert day["label"] == "Saturday 15 Aug"
+    assert day["unique_available"] == 3
+    assert len(day["matches"]) == 2
+    first, second = day["matches"]
+    assert first["available_count"] == 3
+    assert second["available_count"] == 1
+    assert first["umpire_count"] == len({person["id"] for person in people if person["can_umpire"]})
+    assert first["scorer_count"] == len({person["id"] for person in people if person["can_score"]})
+
+
+def test_live_poll_coverage_requires_three_distinct_role_eligible_people():
+    covered = [
+        {"id": 1, "can_umpire": True, "can_score": True},
+        {"id": 2, "can_umpire": True, "can_score": False},
+        {"id": 3, "can_umpire": False, "can_score": True},
+    ]
+    scorer_shortage = [{"id": value, "can_umpire": True, "can_score": False} for value in range(1, 4)]
+    umpire_shortage = [
+        {"id": 1, "can_umpire": True, "can_score": True},
+        {"id": 2, "can_umpire": False, "can_score": True},
+        {"id": 3, "can_umpire": False, "can_score": True},
+    ]
+    assert coverage_status(covered) == "COVERED"
+    assert coverage_status(scorer_shortage) == "SCORER COVERAGE NEEDED"
+    assert coverage_status(umpire_shortage) == "UMPIRE COVERAGE NEEDED"
+    assert coverage_status(covered[:2]) == "NEED MORE"
+
+
+def test_live_poll_excludes_non_open_fixtures_and_uses_singapore_wall_clock():
+    engine = db()
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE id=1"))
+        connection.execute(text("UPDATE fixtures SET poll_state='FROZEN' WHERE id=2"))
+        connection.execute(text("UPDATE fixtures SET poll_state='CLOSED' WHERE id=3"))
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=4"))
+    monitor = live_poll_monitor(engine)
+    assert monitor["open_matches"] == 1
+    assert monitor["days"][0]["label"] == "Saturday 15 Aug"
+    assert monitor["days"][0]["matches"][0]["time"] == "11:00 AM"
+
+
+def test_live_poll_mobile_admin_contract_is_present():
+    source = Path("app.py").read_text(encoding="utf-8")
+    assert "LIVE POLL" in source
+    assert "REFRESH LIVE POLL" in source
+    assert "Yet to Respond" in source
+    assert "@media(max-width:700px)" in source
+    assert "live_poll_monitor(db)" in source

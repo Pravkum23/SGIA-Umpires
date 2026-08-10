@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 from sqlalchemy import create_engine, inspect, text
@@ -8,6 +9,7 @@ CREATE TABLE IF NOT EXISTS availability (person_id INTEGER NOT NULL REFERENCES p
 CREATE TABLE IF NOT EXISTS assignments (fixture_id INTEGER NOT NULL REFERENCES fixtures(id), role VARCHAR(10) NOT NULL, person_id INTEGER NOT NULL REFERENCES people(id), confirmed BOOLEAN NOT NULL DEFAULT FALSE, reason TEXT, status VARCHAR(24) NOT NULL DEFAULT 'ASSIGNED', PRIMARY KEY(fixture_id, role));
 CREATE TABLE IF NOT EXISTS device_tokens (token_hash VARCHAR(64) PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES people(id), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS pin_attempts (person_id INTEGER PRIMARY KEY REFERENCES people(id), failed_count INTEGER NOT NULL DEFAULT 0, lock_until TIMESTAMP);
+CREATE TABLE IF NOT EXISTS poll_submissions (person_id INTEGER NOT NULL REFERENCES people(id), poll_key VARCHAR(64) NOT NULL, submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(person_id,poll_key));
 """
 
 SQLITE_SCHEMA = """
@@ -49,6 +51,7 @@ def people_seed_params():
 
 def initialize(engine):
     with engine.begin() as c:
+        existing_tables = set(inspect(c).get_table_names())
         for statement in schema_for(engine.dialect.name).split(";"):
             if statement.strip(): c.execute(text(statement))
         fixture_columns = {column["name"] for column in inspect(c).get_columns("fixtures")}
@@ -90,6 +93,16 @@ def initialize(engine):
         """))
         c.execute(text("DELETE FROM assignments WHERE role='umpire'"))
         c.execute(text("UPDATE fixtures SET poll_state='OPEN' WHERE availability_open=true AND poll_state='CLOSED'"))
+        if "poll_submissions" not in existing_tables:
+            open_ids = [row.id for row in c.execute(text("SELECT id FROM fixtures WHERE poll_state='OPEN' ORDER BY id"))]
+            if open_ids:
+                key = hashlib.sha256(",".join(map(str, open_ids)).encode("ascii")).hexdigest()
+                c.execute(text("""
+                    INSERT INTO poll_submissions(person_id,poll_key)
+                    SELECT DISTINCT a.person_id,:key FROM availability a JOIN people p ON p.id=a.person_id
+                    WHERE a.fixture_id IN (SELECT id FROM fixtures WHERE poll_state='OPEN') AND p.active=true
+                    ON CONFLICT(person_id,poll_key) DO NOTHING
+                """), {"key": key})
         c.execute(text("DROP VIEW IF EXISTS season_workload"))
         c.execute(text("""
             CREATE VIEW season_workload AS
@@ -124,3 +137,9 @@ def save_vote(engine, person_id, fixture_ids):
             c.execute(text("INSERT INTO availability_events(person_id,fixture_id,event_type) VALUES(:p,:f,'ADDED')"), {"p": person_id, "f": fixture_id})
         for fixture_id in previous - selected:
             c.execute(text("INSERT INTO availability_events(person_id,fixture_id,event_type) VALUES(:p,:f,'REMOVED')"), {"p": person_id, "f": fixture_id})
+        if open_ids:
+            poll_key = hashlib.sha256(",".join(map(str, sorted(open_ids))).encode("ascii")).hexdigest()
+            c.execute(text("""
+                INSERT INTO poll_submissions(person_id,poll_key) VALUES(:p,:key)
+                ON CONFLICT(person_id,poll_key) DO UPDATE SET updated_at=CURRENT_TIMESTAMP
+            """), {"p": person_id, "key": poll_key})

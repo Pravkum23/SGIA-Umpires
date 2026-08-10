@@ -3,6 +3,9 @@ import hmac
 import json
 import os
 from pathlib import Path
+from datetime import datetime
+from html import escape
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -14,6 +17,7 @@ from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, sav
 from src.db import get_engine, initialize, rows, save_vote
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
+from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.routing import is_admin_request
 from src.workload import fixture_history, season_workload, set_match_status
 
@@ -45,7 +49,7 @@ div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border
 </style>"""
 
 ADMIN_CSS = """<style>
-.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}
+.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}.live-title{font-size:1.15rem;font-weight:850;letter-spacing:.04em;margin-top:4px}.live-sub{font-size:.72rem;color:#667085}.live-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:11px 12px;margin:8px 0 12px}.live-ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.coverage-covered{color:#067647;font-weight:800}.coverage-warning{color:#b54708;font-weight:800}.match-live{border-left:4px solid #98a2b3;padding-left:10px;margin:7px 0}.match-live strong{font-size:1rem}.match-people{font-size:.78rem;color:#475467;margin-top:5px}
 @media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}}
 </style>"""
 
@@ -221,12 +225,49 @@ def render_admin(db):
     quick_tab, control, fixtures_tab, allocation, board_tab, people_tab, workload_tab, history_tab, output = st.tabs(["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"])
     with quick_tab:
         st.subheader("Quick Admin")
+        live = live_poll_monitor(db)
+        refresh_col, refreshed_col = st.columns([1, 1])
+        if refresh_col.button("REFRESH LIVE POLL", use_container_width=True):
+            st.rerun()
+        refreshed_col.caption("Last refreshed: " + datetime.now(ZoneInfo(SGIA_TIMEZONE)).strftime("%I:%M %p SGT").lstrip("0"))
+        st.markdown('<div class="live-title">LIVE POLL</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="live-sub"><strong>{live["responded"]} / {live["active_volunteers"]} Responded</strong> · {len(live["yet_to_respond"])} Yet to Respond · {live["open_matches"]} Open Matches</div>', unsafe_allow_html=True)
+        live_cards = st.columns(2)
+        live_metrics = (
+            (live["active_volunteers"], "Active Volunteers"),
+            (live["responded"], "Responded"),
+            (len(live["yet_to_respond"]), "Yet to Respond"),
+            (live["open_matches"], "Open Matches"),
+        )
+        for index, (value, label) in enumerate(live_metrics):
+            live_cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
+        st.markdown("#### Yet to Respond")
+        if live["yet_to_respond"]:
+            st.markdown('<div class="live-alert">' + " · ".join(escape(name) for name in live["yet_to_respond"]) + '</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="live-alert live-ok">✓ Everyone has responded</div>', unsafe_allow_html=True)
+        if not live["days"]:
+            st.info("No availability poll is currently open.")
+        for day in live["days"]:
+            with st.expander(f'{day["label"].upper()} · {len(day["matches"])} Matches · {day["unique_available"]} Unique Available', expanded=True):
+                for match in day["matches"]:
+                    covered = match["coverage"] == "COVERED"
+                    coverage_class = "coverage-covered" if covered else "coverage-warning"
+                    coverage_icon = "✓" if covered else "⚠"
+                    names = " · ".join(escape(person["name"]) for person in match["available"]) or "No volunteers available"
+                    st.markdown(
+                        f'<div class="match-live"><strong>{match["time"]}</strong><br>{escape(match["home_team"])} vs {escape(match["away_team"])}<br>'
+                        f'<b>{match["available_count"]} AVAILABLE</b><br><span class="{coverage_class}">{coverage_icon} {match["coverage"]}</span><br>'
+                        f'<span class="live-sub">{match["umpire_count"]} umpire capable · {match["scorer_count"]} scorer capable</span>'
+                        f'<div class="match-people">{names}</div></div>',
+                        unsafe_allow_html=True,
+                    )
         upcoming = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP")[0]["count"]
         open_count = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE poll_state='OPEN'")[0]["count"]
         responses = rows(db, "SELECT COUNT(DISTINCT person_id) count FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.poll_state IN ('OPEN','FROZEN')")[0]["count"]
         required = rows(db, "SELECT COUNT(*) count FROM assignments WHERE status='REPLACEMENT_REQUIRED'")[0]["count"]
         cards = st.columns(2)
-        for index, (value, label) in enumerate(((upcoming,"Upcoming Matches"),(open_count,"Open Poll"),(responses,"Responses"),(required,"Replacement Required"))):
+        for index, (value, label) in enumerate(((upcoming,"Upcoming Matches"),(open_count,"Open Poll"),(responses,"With Availability"),(required,"Replacement Required"))):
             cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
         st.markdown("#### Season workload")
         for person in season_workload(db)[:5]:
