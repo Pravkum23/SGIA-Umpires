@@ -13,7 +13,7 @@ import streamlit.components.v1 as components
 from sqlalchemy import text
 
 from src.allocation import allocation_message, propose
-from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
+from src.board import BOARD_COLUMNS, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import get_engine, initialize, rows, save_vote
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
@@ -49,8 +49,8 @@ div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border
 </style>"""
 
 ADMIN_CSS = """<style>
-.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}.live-title{font-size:1.15rem;font-weight:850;letter-spacing:.04em;margin-top:4px}.live-sub{font-size:.72rem;color:#667085}.live-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:11px 12px;margin:8px 0 12px}.live-ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.coverage-covered{color:#067647;font-weight:800}.coverage-warning{color:#b54708;font-weight:800}.match-live{border-left:4px solid #98a2b3;padding-left:10px;margin:7px 0}.match-live strong{font-size:1rem}.match-people{font-size:.78rem;color:#475467;margin-top:5px}
-@media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}}
+.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}.live-title{font-size:1.15rem;font-weight:850;letter-spacing:.04em;margin-top:4px}.live-sub{font-size:.72rem;color:#667085}.live-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:11px 12px;margin:8px 0 12px}.live-ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.coverage-covered{color:#067647;font-weight:800}.coverage-warning{color:#b54708;font-weight:800}.match-live{border-left:4px solid #98a2b3;padding-left:10px;margin:7px 0}.match-live strong{font-size:1rem}.match-people{font-size:.78rem;color:#475467;margin-top:5px}.st-key-mobile_allocation_review{display:none}
+@media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}.st-key-desktop_allocation_review{display:none!important}.st-key-mobile_allocation_review{display:block!important}}
 </style>"""
 
 st.markdown(ADMIN_CSS if ADMIN_MODE else PUBLIC_CSS, unsafe_allow_html=True)
@@ -417,28 +417,102 @@ def render_admin(db):
                     st.session_state.fixture_preview = []
                     st.rerun()
     with allocation:
-        left, right = st.columns(2)
+        st.subheader("Allocation Review")
+        left, right, confirm_all_col = st.columns(3)
         if left.button("Generate proposed allocation", use_container_width=True):
             propose(db)
             st.rerun()
         if right.button("Regenerate unconfirmed only", use_container_width=True):
             propose(db, regenerate_unconfirmed=True)
             st.rerun()
-        assignments = rows(db, "SELECT a.fixture_id,a.role,a.person_id,a.confirmed,a.reason,f.starts_at,f.home_team,f.away_team FROM assignments a JOIN fixtures f ON f.id=a.fixture_id ORDER BY f.starts_at,a.role")
-        active = rows(db, "SELECT * FROM people WHERE active=true ORDER BY name")
-        for assignment in assignments:
-            eligible = [p for p in active if p["can_score" if assignment["role"] == "scorer" else "can_umpire"]]
-            with st.container(border=True):
-                st.write(f"**{pd.Timestamp(assignment['starts_at']).strftime('%a %d %b, %I:%M %p')}** · {assignment['home_team']} vs {assignment['away_team']}")
-                names = [p["name"] for p in eligible]
-                current = next(p["name"] for p in active if p["id"] == assignment["person_id"])
-                role_label = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}.get(assignment["role"], assignment["role"].title())
-                choice = st.selectbox(role_label, names, index=names.index(current), key=f"assign_{assignment['fixture_id']}_{assignment['role']}", disabled=bool(assignment["confirmed"]))
-                st.caption(("Confirmed · " if assignment["confirmed"] else "Proposed · ") + (assignment["reason"] or "Manual selection"))
-                if not assignment["confirmed"] and st.button("Save & confirm", key=f"confirm_{assignment['fixture_id']}_{assignment['role']}"):
-                    chosen = next(p["id"] for p in eligible if p["name"] == choice)
-                    confirm_assignment(db, assignment["fixture_id"], assignment["role"], chosen)
-                    st.rerun()
+        if confirm_all_col.button("Confirm all proposed", use_container_width=True):
+            try:
+                count = confirm_all_proposed(db)
+                st.success(f"Confirmed {count} fixture(s).")
+                st.rerun()
+            except ValueError as error:
+                st.error(str(error))
+        review_rows = allocation_review(db)
+        active_people = rows(db, "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY name")
+        umpire_names = [person["name"] for person in active_people if person["can_umpire"]]
+        scorer_names = [person["name"] for person in active_people if person["can_score"]]
+        if not review_rows:
+            st.info("Generate proposed allocations to begin review.")
+        else:
+            desktop_frame = pd.DataFrame(review_rows)
+            with st.container(key="desktop_allocation_review"):
+                st.markdown("#### Fixture allocation table")
+                edited_review = st.data_editor(
+                    desktop_frame,
+                    hide_index=True,
+                    use_container_width=True,
+                    disabled=["fixture_id", "Date", "Time", "Team 1", "Team 2", "Reason", "Status", "Actions"],
+                    column_config={
+                        "fixture_id": None,
+                        "Umpire 1": st.column_config.SelectboxColumn("Umpire 1", options=umpire_names, required=True),
+                        "Umpire 2": st.column_config.SelectboxColumn("Umpire 2", options=umpire_names, required=True),
+                        "Scorer": st.column_config.SelectboxColumn("Scorer", options=scorer_names, required=True),
+                    },
+                    key="allocation_review_table",
+                )
+                edited_records = edited_review.to_dict("records")
+                action_labels = [f"{record['Date']} · {record['Time']} · {record['Team 1']} vs {record['Team 2']}" for record in edited_records]
+                selected_label = st.selectbox("Fixture for row action", action_labels)
+                selected_record = edited_records[action_labels.index(selected_label)]
+                save_row, confirm_row, save_all, confirm_visible = st.columns(4)
+                if save_row.button("Save row", key="desktop_save_review_row", use_container_width=True):
+                    try:
+                        save_allocation_review(db, [selected_record], confirm=False)
+                        st.success("Selected row saved.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+                if confirm_row.button("Confirm row", key="desktop_confirm_review_row", use_container_width=True):
+                    try:
+                        save_allocation_review(db, [selected_record], confirm=True)
+                        st.success("Selected row confirmed.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+                if save_all.button("Save all visible", use_container_width=True):
+                    try:
+                        save_allocation_review(db, edited_records, confirm=False)
+                        st.success("Visible allocation rows saved.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+                if confirm_visible.button("Confirm all visible", use_container_width=True):
+                    try:
+                        save_allocation_review(db, edited_records, confirm=True)
+                        st.success("Visible allocation rows confirmed.")
+                        st.rerun()
+                    except ValueError as error:
+                        st.error(str(error))
+            with st.container(key="mobile_allocation_review"):
+                for review in review_rows:
+                    with st.container(border=True):
+                        st.write(f"**{review['Date']} · {review['Time']}**")
+                        st.write(f"{review['Team 1']} vs {review['Team 2']}")
+                        mobile = dict(review)
+                        for column, options in (("Umpire 1", umpire_names), ("Umpire 2", umpire_names), ("Scorer", scorer_names)):
+                            current = review[column] if review[column] in options else options[0]
+                            mobile[column] = st.selectbox(column, options, index=options.index(current), key=f"mobile_review_{review['fixture_id']}_{column}")
+                        st.caption(f"{review['Status']} · {review['Reason'] or 'Manual selection'}")
+                        save_row, confirm_row = st.columns(2)
+                        if save_row.button("Save row", key=f"save_review_{review['fixture_id']}", use_container_width=True):
+                            try:
+                                save_allocation_review(db, [mobile], confirm=False)
+                                st.success("Row saved.")
+                                st.rerun()
+                            except ValueError as error:
+                                st.error(str(error))
+                        if confirm_row.button("Confirm row", key=f"confirm_review_{review['fixture_id']}", use_container_width=True):
+                            try:
+                                save_allocation_review(db, [mobile], confirm=True)
+                                st.success("Row confirmed.")
+                                st.rerun()
+                            except ValueError as error:
+                                st.error(str(error))
     with board_tab:
         st.subheader("Final Allocation Board")
         replacements = rows(db, """
@@ -583,10 +657,23 @@ def render_admin(db):
         else:
             st.info("No match status events recorded yet.")
     with output:
+        st.subheader("Final Confirmed Allocation")
+        st.caption("Exports include only complete, current assignments that have been confirmed.")
+        final_board = confirmed_allocation_board(db)
+        if not final_board:
+            st.info("No complete confirmed fixture allocations are ready for export.")
+        else:
+            if st.button("Regenerate preview", use_container_width=True):
+                st.rerun()
+            final_png = allocation_board_png(final_board, "assets/sgia-logo.png")
+            st.markdown("#### Preview image")
+            st.image(final_png, use_container_width=True)
+            png_col, csv_col = st.columns(2)
+            png_col.download_button("Download PNG", final_png, "sgia-official-allocation.png", "image/png", use_container_width=True)
+            csv_col.download_button("Download CSV", allocation_board_csv(final_board), "sgia-official-allocation.csv", "text/csv", use_container_width=True)
+        st.markdown("#### WhatsApp text")
         message = allocation_message(db)
-        st.text_area("Copy-ready allocation", message, height=360)
-        export = rows(db, "SELECT f.starts_at,f.home_team,f.away_team,a.role,p.name,a.confirmed FROM assignments a JOIN fixtures f ON f.id=a.fixture_id JOIN people p ON p.id=a.person_id ORDER BY f.starts_at,a.role")
-        st.download_button("Download CSV", pd.DataFrame(export).to_csv(index=False), "sgia_allocations.csv", "text/csv")
+        st.text_area("Copy WhatsApp Message", message, height=360)
 
 
 db = engine()

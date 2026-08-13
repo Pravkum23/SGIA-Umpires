@@ -1,5 +1,6 @@
+import csv
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -7,20 +8,23 @@ from sqlalchemy import text
 
 BOARD_COLUMNS = ["Day", "Date", "Time", "TEAM 1", "TEAM 2", "Umpire 1", "Umpire 2", "Scorer"]
 ROLE_COLUMNS = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}
+REVIEW_COLUMNS = ["Date", "Time", "Team 1", "Team 2", "Umpire 1", "Umpire 2", "Scorer", "Reason", "Status", "Actions"]
 
 
 def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
 
 
-def allocation_board(engine):
+def allocation_board(engine, confirmed_only=False):
+    assignment_filter = " AND a.confirmed=true AND a.status='ASSIGNED'" if confirmed_only else ""
+    exists_filter = " AND x.confirmed=true AND x.status='ASSIGNED'" if confirmed_only else ""
     with engine.connect() as connection:
-        data = list(connection.execute(text("""
+        data = list(connection.execute(text(f"""
             SELECT f.id fixture_id,f.starts_at,f.home_team,f.away_team,a.role,p.name
             FROM fixtures f
-            LEFT JOIN assignments a ON a.fixture_id=f.id
+            LEFT JOIN assignments a ON a.fixture_id=f.id{assignment_filter}
             LEFT JOIN people p ON p.id=a.person_id
-            WHERE EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id)
+            WHERE EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id{exists_filter})
             ORDER BY f.starts_at,a.role
         """)).mappings())
     board = {}
@@ -40,6 +44,119 @@ def allocation_board(engine):
         if row.role in ROLE_COLUMNS:
             item[ROLE_COLUMNS[row.role]] = row.name or ""
     return list(board.values())
+
+
+def allocation_review(engine):
+    """Return one editable review row per fixture with all three roles together."""
+    with engine.connect() as connection:
+        data = list(connection.execute(text("""
+            SELECT f.id fixture_id,f.starts_at,f.home_team,f.away_team,a.role,p.name,
+                   a.confirmed,a.reason,a.status assignment_status
+            FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
+            JOIN people p ON p.id=a.person_id
+            ORDER BY f.starts_at,a.role
+        """)).mappings())
+    review = {}
+    for row in data:
+        starts = _dt(row.starts_at)
+        item = review.setdefault(row.fixture_id, {
+            "fixture_id": row.fixture_id,
+            "Date": starts.strftime("%d-%b-%Y"),
+            "Time": starts.strftime("%I:%M %p").lstrip("0"),
+            "Team 1": row.home_team,
+            "Team 2": row.away_team,
+            "Umpire 1": "", "Umpire 2": "", "Scorer": "",
+            "Reason": [], "_confirmed": [], "_statuses": [],
+        })
+        if row.role in ROLE_COLUMNS:
+            item[ROLE_COLUMNS[row.role]] = row.name
+        if row.reason and row.reason not in item["Reason"]:
+            item["Reason"].append(row.reason)
+        item["_confirmed"].append(bool(row.confirmed))
+        item["_statuses"].append(row.assignment_status)
+    result = []
+    for item in review.values():
+        statuses = item.pop("_statuses")
+        confirmed = item.pop("_confirmed")
+        item["Reason"] = "; ".join(item["Reason"])
+        if "REPLACEMENT_REQUIRED" in statuses:
+            item["Status"] = "Replacement Required"
+        elif len(confirmed) == 3 and all(confirmed):
+            item["Status"] = "Confirmed"
+        else:
+            item["Status"] = "Proposed"
+        item["Actions"] = "Save row / Confirm row"
+        result.append(item)
+    return result
+
+
+def confirmed_allocation_board(engine):
+    """Return only complete fixtures whose three current assignments are confirmed and active."""
+    return [
+        record for record in allocation_board(engine, confirmed_only=True)
+        if all(record[column] for column in ("Umpire 1", "Umpire 2", "Scorer"))
+    ]
+
+
+def allocation_board_csv(records):
+    """Serialize the official board columns in their published display order."""
+    output = StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=BOARD_COLUMNS, extrasaction="ignore", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(records)
+    return output.getvalue()
+
+
+def save_allocation_review(engine, records, confirm=False):
+    """Save reviewed names; optionally confirm every role in the supplied rows."""
+    with engine.begin() as connection:
+        people = {row.name: row for row in connection.execute(text(
+            "SELECT id,name,can_umpire,can_score FROM people WHERE active=true"
+        )).mappings()}
+        for record in records:
+            fixture_id = int(record["fixture_id"])
+            names = [str(record.get(column, "") or "").strip() for column in ROLE_COLUMNS.values()]
+            if not all(names):
+                raise ValueError("Umpire 1, Umpire 2 and Scorer are required")
+            if len(set(names)) != 3:
+                raise ValueError("Each fixture requires three distinct people")
+            for role, column in ROLE_COLUMNS.items():
+                name = str(record[column]).strip()
+                if name not in people:
+                    raise ValueError(f"Unknown or inactive person: {name}")
+                person = people[name]
+                capable = person.can_score if role == "scorer" else person.can_umpire
+                if not capable:
+                    raise ValueError(f"{name} is not eligible for {column}")
+                existing = connection.execute(text("""
+                    SELECT person_id,confirmed FROM assignments
+                    WHERE fixture_id=:fixture AND role=:role
+                """), {"fixture": fixture_id, "role": role}).mappings().first()
+                keep_confirmed = bool(existing and existing.confirmed) or confirm
+                connection.execute(text("""
+                    INSERT INTO assignments(fixture_id,role,person_id,confirmed,reason,status)
+                    VALUES(:fixture,:role,:person,:confirmed,'Admin allocation review','ASSIGNED')
+                    ON CONFLICT(fixture_id,role) DO UPDATE SET person_id=:person,
+                        confirmed=:confirmed,reason='Admin allocation review',status='ASSIGNED'
+                """), {"fixture": fixture_id, "role": role, "person": person.id, "confirmed": keep_confirmed})
+                if existing and existing.person_id != person.id:
+                    connection.execute(text("""
+                        INSERT INTO assignment_events(fixture_id,role,person_id,replacement_person_id,event_type,reason)
+                        VALUES(:fixture,:role,:previous,:replacement,'MANUAL_CHANGE','Allocation review edit')
+                    """), {"fixture": fixture_id, "role": role, "previous": existing.person_id, "replacement": person.id})
+                if confirm and (not existing or not existing.confirmed):
+                    connection.execute(text("""
+                        INSERT INTO assignment_events(fixture_id,role,person_id,event_type,reason)
+                        VALUES(:fixture,:role,:person,'CONFIRMED','Allocation review confirmation')
+                    """), {"fixture": fixture_id, "role": role, "person": person.id})
+
+
+def confirm_all_proposed(engine):
+    """Confirm every complete, active proposal and preserve a per-role audit event."""
+    review = [row for row in allocation_review(engine) if row["Status"] == "Proposed"]
+    if review:
+        save_allocation_review(engine, review, confirm=True)
+    return len(review)
 
 
 def save_allocation_board(engine, records):

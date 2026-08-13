@@ -101,19 +101,18 @@ def allocation_message(engine):
         data = list(c.execute(text("""
             SELECT f.starts_at,f.home_team,f.away_team,a.role,p.name
             FROM assignments a JOIN fixtures f ON f.id=a.fixture_id JOIN people p ON p.id=a.person_id
-            WHERE a.confirmed=true ORDER BY f.starts_at,a.role
+            WHERE a.confirmed=true AND a.status='ASSIGNED' ORDER BY f.starts_at,a.role
         """)).mappings())
     grouped = {}
     for row in data:
         dt = _dt(row.starts_at)
         grouped.setdefault((dt, row.home_team, row.away_team), {})[row.role] = row.name
-    lines = ["🏏 *SGIA Umpires – Allocation*", ""]
-    last_date = None
+    lines = ["🏏 *SGIA Umpires – Final Allocation*", ""]
     for (dt, home, away), assigned in grouped.items():
-        if dt.date() != last_date:
-            lines += [f"*{dt.strftime('%A, %d %b')}*", ""]
-            last_date = dt.date()
-        lines += [dt.strftime("%I:%M %p").lstrip("0"), f"{home} vs {away}",
+        if not all(role in assigned for role in ("umpire_1", "umpire_2", "scorer")):
+            continue
+        lines += [f"{dt.strftime('%a %d-%b-%Y')} | {dt.strftime('%I:%M %p').lstrip('0')}",
+                  f"{home} vs {away}",
                   f"Umpire 1: {assigned.get('umpire_1', 'TBC')}",
                   f"Umpire 2: {assigned.get('umpire_2', 'TBC')}",
                   f"Scorer: {assigned.get('scorer', 'TBC')}", ""]

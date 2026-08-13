@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, text
 from streamlit.testing.v1 import AppTest
 
 from src.allocation import allocation_message, propose
-from src.board import BOARD_COLUMNS, allocation_board, allocation_board_png, save_allocation_board
+from src.board import BOARD_COLUMNS, REVIEW_COLUMNS, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import authenticate_person, availability_for_person, forget_person, person_for_token, remember_person, replace_assignment, set_person_pin, suggest_replacement, verify_person_pin, withdraw_assignment
@@ -285,6 +285,91 @@ def test_allocation_board_png_export():
     image = allocation_board_png(allocation_board(engine), Path(__file__).parents[1] / "assets" / "sgia-logo.png")
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(image) > 10_000
+
+
+def test_allocation_review_is_one_editable_row_per_fixture():
+    engine = db()
+    open_and_vote_all(engine, [1, 2])
+    propose(engine)
+    review = allocation_review(engine)
+    assert len(review) == 2
+    assert list({key: None for key in review[0] if key != "fixture_id"}) == REVIEW_COLUMNS
+    assert all(row["Umpire 1"] and row["Umpire 2"] and row["Scorer"] for row in review)
+    assert all(row["Status"] == "Proposed" for row in review)
+
+
+def test_allocation_review_row_save_then_confirm_is_audited():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    review = allocation_review(engine)[0]
+    original = review["Umpire 1"]
+    excluded = {review["Umpire 1"], review["Umpire 2"], review["Scorer"]}
+    review["Umpire 1"] = next(
+        person["name"] for person in rows(engine, "SELECT name FROM people WHERE active=true AND can_umpire=true ORDER BY name")
+        if person["name"] not in excluded
+    )
+    save_allocation_review(engine, [review], confirm=False)
+    saved = rows(engine, """
+        SELECT p.name,a.confirmed FROM assignments a JOIN people p ON p.id=a.person_id
+        WHERE a.fixture_id=1 AND a.role='umpire_1'
+    """)[0]
+    assert saved == {"name": review["Umpire 1"], "confirmed": 0}
+    assert rows(engine, "SELECT event_type FROM assignment_events WHERE fixture_id=1") == [{"event_type": "MANUAL_CHANGE"}]
+    assert confirmed_allocation_board(engine) == []
+
+    save_allocation_review(engine, [review], confirm=True)
+    assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1 AND confirmed=true AND status='ASSIGNED'")[0]["n"] == 3
+    assert rows(engine, "SELECT COUNT(*) n FROM assignment_events WHERE fixture_id=1 AND event_type='CONFIRMED'")[0]["n"] == 3
+    assert confirmed_allocation_board(engine)[0]["Umpire 1"] == review["Umpire 1"]
+    manual_event = rows(engine, """
+        SELECT old.name person,new.name replacement,e.event_type
+        FROM assignment_events e JOIN people old ON old.id=e.person_id
+        JOIN people new ON new.id=e.replacement_person_id
+        WHERE e.event_type='MANUAL_CHANGE'
+    """)[0]
+    assert manual_event == {"person": original, "replacement": review["Umpire 1"], "event_type": "MANUAL_CHANGE"}
+
+
+def test_confirm_all_proposed_and_final_exports_are_confirmed_only():
+    engine = db()
+    open_and_vote_all(engine, [1, 2])
+    propose(engine)
+    assert confirmed_allocation_board(engine) == []
+    assert allocation_message(engine).strip().endswith("Final Allocation*")
+    assert confirm_all_proposed(engine) == 2
+    final = confirmed_allocation_board(engine)
+    assert len(final) == 2
+    csv_text = allocation_board_csv(final)
+    assert csv_text.splitlines()[0] == ",".join(BOARD_COLUMNS)
+    assert final[0]["Umpire 1"] in csv_text
+    message = allocation_message(engine)
+    assert "SGIA Umpires" in message
+    assert "Changi Risers vs Black Panthers" in message
+    assert "Umpire 1:" in message and "Umpire 2:" in message and "Scorer:" in message
+
+
+def test_output_excludes_incomplete_or_replacement_required_assignments():
+    engine = db()
+    open_and_vote_all(engine, [1])
+    propose(engine)
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE assignments SET confirmed=true WHERE fixture_id=1"))
+        connection.execute(text("UPDATE assignments SET status='REPLACEMENT_REQUIRED' WHERE fixture_id=1 AND role='umpire_1'"))
+    assert confirmed_allocation_board(engine) == []
+    assert "Changi Risers" not in allocation_message(engine)
+
+
+def test_admin_allocation_review_has_desktop_and_mobile_contracts():
+    source = Path("app.py").read_text(encoding="utf-8")
+    assert 'key="desktop_allocation_review"' in source
+    assert 'key="mobile_allocation_review"' in source
+    assert "@media(max-width:700px)" in source
+    assert ".st-key-desktop_allocation_review{display:none!important}" in source
+    assert "Save row" in source and "Confirm row" in source
+    assert "Generate proposed allocation" in source and "Regenerate unconfirmed only" in source
+    assert "Final Confirmed Allocation" in source
+    assert "Download PNG" in source and "Download CSV" in source and "Copy WhatsApp Message" in source
 
 
 def test_public_route_has_no_admin_navigation():
