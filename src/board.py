@@ -195,32 +195,41 @@ def _font(size, bold=False):
     candidates = [
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "LiberationSans-Bold.ttf" if bold else "LiberationSans-Regular.ttf",
     ]
     for candidate in candidates:
-        if Path(candidate).exists():
+        try:
             return ImageFont.truetype(candidate, size)
-    return ImageFont.load_default()
+        except OSError:
+            continue
+    # Pillow's scalable built-in fallback preserves the requested size even on
+    # minimal Streamlit containers with no system font packages installed.
+    return ImageFont.load_default(size=size)
 
 
 def allocation_board_png(records, logo_path=None):
     """Render a deterministic, WhatsApp-shareable official allocation sheet."""
     widths = [130, 175, 135, 245, 245, 190, 190, 190]
-    margin, title_height, header_height, row_height = 34, 142, 58, 66
+    margin, title_height, header_height, row_height = 34, 116, 72, 86
     width = sum(widths) + margin * 2
     height = title_height + header_height + max(1, len(records)) * row_height + margin
     image = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(image)
     navy, yellow, grid = "#173F78", "#F4C542", "#27364A"
     draw.rectangle((0, 0, width, title_height), fill=navy)
-    title_font, header_font, cell_font = _font(36, True), _font(18, True), _font(17)
+    title_font, header_font, cell_font = _font(52, True), _font(25, True), _font(24, True)
     title = "SGIA Official"
     title_box = draw.textbbox((0, 0), title, font=title_font)
-    draw.text(((width - (title_box[2] - title_box[0])) / 2, 46), title, fill="white", font=title_font)
+    title_y = (title_height - (title_box[3] - title_box[1])) / 2 - title_box[1]
+    draw.text(((width - (title_box[2] - title_box[0])) / 2, title_y), title, fill="white", font=title_font)
     if logo_path and Path(logo_path).exists():
         with Image.open(logo_path) as source:
             logo = source.convert("RGBA")
-            logo.thumbnail((92, 92), Image.Resampling.LANCZOS)
-            image.paste(logo, (margin, 24), logo)
+            logo.thumbnail((88, 88), Image.Resampling.LANCZOS)
+            image.paste(logo, (margin, (title_height - logo.height) // 2), logo)
 
     top = title_height
     x = margin

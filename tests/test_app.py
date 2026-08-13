@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, text
 from streamlit.testing.v1 import AppTest
 
 from src.allocation import allocation_message, propose
-from src.board import BOARD_COLUMNS, REVIEW_COLUMNS, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
+from src.board import BOARD_COLUMNS, REVIEW_COLUMNS, _font, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import authenticate_person, availability_for_person, forget_person, person_for_token, remember_person, replace_assignment, set_person_pin, suggest_replacement, verify_person_pin, withdraw_assignment
@@ -286,6 +286,10 @@ def test_allocation_board_png_export():
     image = allocation_board_png(allocation_board(engine), Path(__file__).parents[1] / "assets" / "sgia-logo.png")
     assert image.startswith(b"\x89PNG\r\n\x1a\n")
     assert len(image) > 10_000
+    title_bounds = _font(52, True).getbbox("SGIA Official")
+    cell_bounds = _font(24, True).getbbox("Black Panthers")
+    assert title_bounds[3] - title_bounds[1] >= 38
+    assert cell_bounds[3] - cell_bounds[1] >= 17
 
 
 def test_allocation_review_is_one_editable_row_per_fixture():
