@@ -18,6 +18,7 @@ from src.db import get_engine, initialize, rows, save_vote
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
 from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
 from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
+from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
 from src.workload import fixture_history, season_workload, set_match_status
 
@@ -155,6 +156,13 @@ def render_public(db):
     """)
     slots = open_slots or frozen_slots
     poll_state = "OPEN" if open_slots else ("FROZEN" if frozen_slots else None)
+    try:
+        user_agent = st.context.headers.get("User-Agent", "")
+    except Exception:
+        user_agent = ""
+    device_type, browser_name = coarse_client(user_agent)
+    if poll_state:
+        record_poll_view(db, person_id, poll_state, device_type, browser_name)
     selected = {r["fixture_id"] for r in rows(db, "SELECT fixture_id FROM availability WHERE person_id=:person", {"person": person_id})}
     if not slots:
         st.markdown('<div class="poll-message">No availability poll is open right now.</div><div class="view-votes">View votes</div>', unsafe_allow_html=True)
@@ -178,7 +186,7 @@ def render_public(db):
                 st.markdown('<div class="submitted"><strong>✓ Availability submitted</strong>You can return and update your choices until the poll closes.</div>', unsafe_allow_html=True)
             label = "UPDATE MY AVAILABILITY" if selected & {slot["id"] for slot in slots} else "SAVE MY AVAILABILITY"
             if st.button(label, use_container_width=True, type="primary"):
-                save_vote(db, person_id, choices)
+                save_vote(db, person_id, choices, device_type, browser_name)
                 st.session_state.availability_saved = True
                 st.rerun()
         with st.expander("View votes"):
@@ -231,12 +239,13 @@ def render_admin(db):
             st.rerun()
         refreshed_col.caption("Last refreshed: " + datetime.now(ZoneInfo(SGIA_TIMEZONE)).strftime("%I:%M %p SGT").lstrip("0"))
         st.markdown('<div class="live-title">LIVE POLL</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="live-sub"><strong>{live["responded"]} / {live["active_volunteers"]} Responded</strong> · {len(live["yet_to_respond"])} Yet to Respond · {live["open_matches"]} Open Matches</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="live-sub"><strong>{live["responded"]} / {live["active_volunteers"]} Responded</strong> · {len(live["yet_to_respond"])} Yet to Respond · {len(live["needs_review"])} Needs Review · {live["open_matches"]} Open Matches</div>', unsafe_allow_html=True)
         live_cards = st.columns(2)
         live_metrics = (
             (live["active_volunteers"], "Active Volunteers"),
             (live["responded"], "Responded"),
             (len(live["yet_to_respond"]), "Yet to Respond"),
+            (len(live["needs_review"]), "Needs Review"),
             (live["open_matches"], "Open Matches"),
         )
         for index, (value, label) in enumerate(live_metrics):
@@ -246,6 +255,66 @@ def render_admin(db):
             st.markdown('<div class="live-alert">' + " · ".join(escape(name) for name in live["yet_to_respond"]) + '</div>', unsafe_allow_html=True)
         else:
             st.markdown('<div class="live-alert live-ok">✓ Everyone has responded</div>', unsafe_allow_html=True)
+        for title, names in (
+            ("Viewed — Not Submitted", live["viewed_not_submitted"]),
+            ("Responded — No Availability", live["responded_zero"]),
+            ("Needs Review", live["needs_review"]),
+        ):
+            if names:
+                st.markdown(f"#### {title}")
+                st.markdown('<div class="live-alert">' + " · ".join(escape(name) for name in names) + '</div>', unsafe_allow_html=True)
+        st.markdown('<div class="live-title">RESPONSE AUDIT</div>', unsafe_allow_html=True)
+        audit_cycles = rows(db, "SELECT id,status,revision,created_at FROM poll_cycles ORDER BY id DESC")
+        if not audit_cycles:
+            st.info("Open a poll to begin collecting response evidence.")
+        else:
+            cycle_labels = [f"Cycle {cycle['id']} · {cycle['status']} · Revision {cycle['revision']}" for cycle in audit_cycles]
+            default_cycle = next((index for index, cycle in enumerate(audit_cycles) if cycle["id"] == live.get("poll_cycle_id")), 0)
+            selected_cycle_label = st.selectbox("Poll cycle", cycle_labels, index=default_cycle, key="response_audit_cycle")
+            selected_cycle = audit_cycles[cycle_labels.index(selected_cycle_label)]
+            audit = response_audit(db, selected_cycle["id"])
+            audit_names = [person["Person"] for person in audit["people"]]
+            audit_name = st.selectbox("Volunteer", audit_names, key="response_audit_person")
+            audited = next(person for person in audit["people"] if person["Person"] == audit_name)
+            warning = " · ⚠ NEEDS REVIEW — Poll changed after last submission" if audited["Needs Review"] else ""
+            st.markdown(f"### {escape(audited['Person'])}")
+            st.markdown(f"**{escape(audited['Status'])}**{warning}")
+            details = [
+                ("First viewed", audited["First Viewed SGT"] or "No recorded view"),
+                ("First submitted", audited["First Submitted SGT"] or "Not submitted"),
+                ("Last updated", audited["Last Updated SGT"] or "Not submitted"),
+                ("Submissions", str(audited["Submission Count"])),
+                ("Current selection", f"{audited['Selected Count']} matches"),
+                ("Device", audited["Device"]), ("Browser", audited["Browser"]),
+            ]
+            for label, value in details:
+                st.markdown(f"**{label}:** {escape(value)}")
+            if audited["Evidence Source"] == "LEGACY_BACKFILL":
+                st.info("Legacy response imported — exact original view history is unavailable.")
+            st.markdown("#### Current Selections")
+            if audited["Current Selections"]:
+                for selection in audited["Current Selections"]:
+                    st.markdown(f"**{escape(selection['when'])}**  \n{escape(selection['match'])}")
+            elif audited["Submission Count"]:
+                st.caption("Zero fixtures were saved in the latest response.")
+            else:
+                st.caption("No submission has been recorded.")
+            st.markdown("#### Activity History")
+            history = activity_history(db, audit["cycle"]["id"], audited["person_id"])
+            if not history:
+                st.caption("No activity evidence recorded.")
+            for event in history:
+                wording = {"VIEWED": "Poll successfully viewed", "SUBMITTED": "Submission recorded", "UPDATED": "Update recorded", "LEGACY_IMPORTED": "Legacy response imported"}.get(event["event_type"], event["event_type"].title())
+                if event["event_type"] in ("SUBMITTED", "UPDATED", "LEGACY_IMPORTED"):
+                    with st.expander(f"{event['timestamp']} — {wording} · {event['selected_count']} fixtures saved"):
+                        if event["selections"]:
+                            for selection in event["selections"]:
+                                st.write(f"{selection['when']} — {selection['match']}")
+                        else:
+                            st.write("Zero fixtures were saved.")
+                else:
+                    st.write(f"{event['timestamp']} — {wording}")
+            st.download_button("DOWNLOAD RESPONSE AUDIT CSV", response_audit_csv(audit), "sgia-response-audit.csv", "text/csv", use_container_width=True)
         if not live["days"]:
             st.info("No availability poll is currently open.")
         for day in live["days"]:
@@ -280,7 +349,7 @@ def render_admin(db):
         st.markdown("#### Quick actions")
         qa1, qa2 = st.columns(2)
         if qa1.button("FREEZE POLL", key="quick_freeze"):
-            with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state='FROZEN',availability_open=false WHERE poll_state='OPEN'"))
+            transition_poll_state(db, "OPEN", "FROZEN")
             st.rerun()
         if qa2.button("GENERATE ALLOCATION", key="quick_generate"):
             propose(db, regenerate_unconfirmed=True); st.rerun()
@@ -293,7 +362,8 @@ def render_admin(db):
         def quick_add(open_poll=False):
             if add_fixture(db,q_date,q_time,q_team1,q_team2):
                 if open_poll:
-                    with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state='OPEN',availability_open=true WHERE home_team=:home AND away_team=:away AND poll_state='CLOSED'"),{"home":q_team1.strip(),"away":q_team2.strip()})
+                    fixture_id = rows(db, "SELECT id FROM fixtures WHERE home_team=:home AND away_team=:away ORDER BY id DESC LIMIT 1", {"home":q_team1.strip(),"away":q_team2.strip()})[0]["id"]
+                    set_fixture_poll_state(db, fixture_id, "OPEN")
                 st.success("Match added" + (" and poll opened." if open_poll else ".")); st.rerun()
             else: st.warning("Duplicate fixture was not added.")
         if q_add.button("ADD MATCH", key="quick_add"):
@@ -310,7 +380,7 @@ def render_admin(db):
                 action_cols=st.columns(4)
                 for idx,(label,state) in enumerate((("Open","OPEN"),("Close","CLOSED"),("Freeze","FROZEN"),("Publish","PUBLISHED"))):
                     if action_cols[idx].button(label,key=f"mobile_state_{fixture['id']}_{state}"):
-                        with db.begin() as connection: connection.execute(text("UPDATE fixtures SET poll_state=:state,availability_open=:opened WHERE id=:id"),{"state":state,"opened":state=="OPEN","id":fixture["id"]})
+                        set_fixture_poll_state(db, fixture["id"], state)
                         st.rerun()
                 match_actions = st.columns(3)
                 for idx, (label, status) in enumerate((("MARK COMPLETED", "COMPLETED"), ("MARK CANCELLED", "CANCELLED"), ("RESTORE TO SCHEDULED", "SCHEDULED"))):
@@ -346,13 +416,11 @@ def render_admin(db):
         st.caption(" · ".join(f"{item['poll_state']}: {item['count']}" for item in state_counts))
         freeze_col, publish_col = st.columns(2)
         if freeze_col.button("Freeze Open Poll", use_container_width=True):
-            with db.begin() as connection:
-                connection.execute(text("UPDATE fixtures SET poll_state='FROZEN',availability_open=false WHERE poll_state='OPEN'"))
+            transition_poll_state(db, "OPEN", "FROZEN")
             st.success("Open availability is now frozen.")
             st.rerun()
         if publish_col.button("Publish Frozen Allocation", use_container_width=True):
-            with db.begin() as connection:
-                connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED',availability_open=false WHERE poll_state='FROZEN'"))
+            transition_poll_state(db, "FROZEN", "PUBLISHED")
             st.success("Allocation published. Volunteers can now see their confirmed duties.")
             st.rerun()
         opened = []
@@ -364,10 +432,7 @@ def render_admin(db):
             if voters:
                 st.caption("Available: " + ", ".join(v["name"] for v in voters))
         if st.button("Update open slots"):
-            with db.begin() as connection:
-                connection.execute(text("UPDATE fixtures SET availability_open=false,poll_state='CLOSED' WHERE poll_state='OPEN'"))
-                for fixture_id in opened:
-                    connection.execute(text("UPDATE fixtures SET availability_open=true,poll_state='OPEN' WHERE id=:id AND poll_state='CLOSED'"), {"id": fixture_id})
+            update_open_slots(db, opened)
             st.success("Open slots updated")
             st.rerun()
     with fixtures_tab:

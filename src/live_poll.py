@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from .poll_audit import response_audit
+
 
 SGIA_TIMEZONE = "Asia/Singapore"
 
@@ -44,13 +46,6 @@ def live_poll_monitor(engine):
         active = [dict(row) for row in connection.execute(text(
             "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY name"
         )).mappings()]
-        key = poll_key([fixture["id"] for fixture in fixtures])
-        respondent_ids = set()
-        if key:
-            respondent_ids = {row.person_id for row in connection.execute(text("""
-                SELECT s.person_id FROM poll_submissions s JOIN people p ON p.id=s.person_id
-                WHERE s.poll_key=:key AND p.active=true
-            """), {"key": key})}
         availability = [dict(row) for row in connection.execute(text("""
             SELECT a.fixture_id,p.id,p.name,p.can_umpire,p.can_score
             FROM availability a JOIN people p ON p.id=a.person_id JOIN fixtures f ON f.id=a.fixture_id
@@ -83,11 +78,20 @@ def live_poll_monitor(engine):
     for day in by_day.values():
         day["unique_available"] = len(day.pop("available_ids"))
         days.append(day)
+    audit = response_audit(engine)
+    audited_people = audit["people"] if audit["cycle"] and audit["cycle"]["status"] == "OPEN" else []
+    responded = [person for person in audited_people if person["Submission Count"] > 0]
+    not_responded = [person for person in audited_people if person["Submission Count"] == 0]
     return {
-        "poll_key": key,
+        "poll_key": f"cycle:{audit['cycle']['id']}" if audit["cycle"] else None,
+        "poll_cycle_id": audit["cycle"]["id"] if audit["cycle"] else None,
+        "poll_revision": audit["cycle"]["revision"] if audit["cycle"] else None,
         "active_volunteers": len(active),
-        "responded": len(respondent_ids),
-        "yet_to_respond": [person["name"] for person in active if person["id"] not in respondent_ids],
+        "responded": len(responded),
+        "yet_to_respond": [person["Person"] for person in not_responded],
+        "viewed_not_submitted": [person["Person"] for person in not_responded if person["Status"] == "VIEWED — NOT SUBMITTED"],
+        "responded_zero": [person["Person"] for person in responded if person["Selected Count"] == 0],
+        "needs_review": [person["Person"] for person in responded if person["Needs Review"]],
         "open_matches": len(fixtures),
         "days": days,
     }
