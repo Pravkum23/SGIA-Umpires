@@ -6,6 +6,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import text
 
+from src.allocation_scope import current_allocation_cycle
+
 BOARD_COLUMNS = ["Day", "Date", "Time", "TEAM 1", "TEAM 2", "Umpire 1", "Umpire 2", "Scorer"]
 ROLE_COLUMNS = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}
 REVIEW_COLUMNS = ["Date", "Time", "Team 1", "Team 2", "Umpire 1", "Umpire 2", "Scorer", "Reason", "Status", "Actions"]
@@ -15,18 +17,24 @@ def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
 
 
-def allocation_board(engine, confirmed_only=False):
+def allocation_board(engine, confirmed_only=False, cycle_id=None):
     assignment_filter = " AND a.confirmed=true AND a.status='ASSIGNED'" if confirmed_only else ""
     exists_filter = " AND x.confirmed=true AND x.status='ASSIGNED'" if confirmed_only else ""
     with engine.connect() as connection:
+        if cycle_id is None:
+            cycle = current_allocation_cycle(connection)
+            if not cycle:
+                return []
+            cycle_id = cycle.id
         data = list(connection.execute(text(f"""
             SELECT f.id fixture_id,f.starts_at,f.home_team,f.away_team,a.role,p.name
             FROM fixtures f
             LEFT JOIN assignments a ON a.fixture_id=f.id{assignment_filter}
             LEFT JOIN people p ON p.id=a.person_id
-            WHERE EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id{exists_filter})
+            WHERE f.poll_cycle_id=:cycle AND f.poll_state<>'CLOSED'
+              AND EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id{exists_filter})
             ORDER BY f.starts_at,a.role
-        """)).mappings())
+        """), {"cycle": cycle_id}).mappings())
     board = {}
     for row in data:
         starts = _dt(row.starts_at)
@@ -46,16 +54,22 @@ def allocation_board(engine, confirmed_only=False):
     return list(board.values())
 
 
-def allocation_review(engine):
+def allocation_review(engine, cycle_id=None):
     """Return one editable review row per fixture with all three roles together."""
     with engine.connect() as connection:
+        if cycle_id is None:
+            cycle = current_allocation_cycle(connection)
+            if not cycle:
+                return []
+            cycle_id = cycle.id
         data = list(connection.execute(text("""
             SELECT f.id fixture_id,f.starts_at,f.home_team,f.away_team,a.role,p.name,
                    a.confirmed,a.reason,a.status assignment_status
             FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
             JOIN people p ON p.id=a.person_id
+            WHERE f.poll_cycle_id=:cycle AND f.poll_state<>'CLOSED'
             ORDER BY f.starts_at,a.role
-        """)).mappings())
+        """), {"cycle": cycle_id}).mappings())
     review = {}
     for row in data:
         starts = _dt(row.starts_at)
@@ -90,10 +104,10 @@ def allocation_review(engine):
     return result
 
 
-def confirmed_allocation_board(engine):
+def confirmed_allocation_board(engine, cycle_id=None):
     """Return only complete fixtures whose three current assignments are confirmed and active."""
     return [
-        record for record in allocation_board(engine, confirmed_only=True)
+        record for record in allocation_board(engine, confirmed_only=True, cycle_id=cycle_id)
         if all(record[column] for column in ("Umpire 1", "Umpire 2", "Scorer"))
     ]
 

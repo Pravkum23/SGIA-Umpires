@@ -2,6 +2,9 @@ from collections import defaultdict
 from datetime import datetime
 from sqlalchemy import text
 
+from src.allocation_scope import current_allocation_cycle
+from src.poll_audit import ensure_allocation_cycle
+
 
 def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
@@ -10,14 +13,23 @@ def _dt(value):
 def propose(engine, regenerate_unconfirmed=False):
     """Create proposals from saved votes; poll open/closed state is intentionally irrelevant."""
     with engine.begin() as c:
+        ensure_allocation_cycle(c)
+        cycle = current_allocation_cycle(c)
+        if not cycle:
+            return 0
         if regenerate_unconfirmed:
-            c.execute(text("DELETE FROM assignments WHERE confirmed=false"))
+            c.execute(text("""
+                DELETE FROM assignments WHERE confirmed=false AND fixture_id IN (
+                    SELECT id FROM fixtures WHERE poll_cycle_id=:cycle
+                )
+            """), {"cycle": cycle.id})
 
         fixtures = list(c.execute(text("""
             SELECT f.* FROM fixtures f
-            WHERE EXISTS (SELECT 1 FROM availability a WHERE a.fixture_id=f.id)
+            WHERE f.poll_cycle_id=:cycle AND f.poll_state IN ('OPEN','FROZEN')
+              AND EXISTS (SELECT 1 FROM availability a WHERE a.fixture_id=f.id)
             ORDER BY f.starts_at
-        """)).mappings())
+        """), {"cycle": cycle.id}).mappings())
         existing = {(r.fixture_id, r.role): r for r in c.execute(text("SELECT * FROM assignments")).mappings()}
         season = {
             row.person_id: (int(row.games_completed), int(row.total_assigned))
@@ -96,13 +108,20 @@ def propose(engine, regenerate_unconfirmed=False):
                 schedule[chosen.id].append((starts, role))
 
 
-def allocation_message(engine):
+def allocation_message(engine, cycle_id=None):
     with engine.connect() as c:
+        if cycle_id is None:
+            cycle = current_allocation_cycle(c)
+            if not cycle:
+                return "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
+            cycle_id = cycle.id
         data = list(c.execute(text("""
             SELECT f.starts_at,f.home_team,f.away_team,a.role,p.name
             FROM assignments a JOIN fixtures f ON f.id=a.fixture_id JOIN people p ON p.id=a.person_id
-            WHERE a.confirmed=true AND a.status='ASSIGNED' ORDER BY f.starts_at,a.role
-        """)).mappings())
+            WHERE a.confirmed=true AND a.status='ASSIGNED' AND f.poll_cycle_id=:cycle
+              AND f.poll_state<>'CLOSED'
+            ORDER BY f.starts_at,a.role
+        """), {"cycle": cycle_id}).mappings())
     grouped = {}
     for row in data:
         dt = _dt(row.starts_at)

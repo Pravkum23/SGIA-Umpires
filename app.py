@@ -13,6 +13,7 @@ import streamlit.components.v1 as components
 from sqlalchemy import text
 
 from src.allocation import allocation_message, propose
+from src.allocation_scope import current_allocation_summary, published_allocation_cycles
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import get_engine, initialize, rows, save_vote
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
@@ -80,6 +81,13 @@ def brand(admin=False):
 def date_label(value):
     dt = pd.Timestamp(value)
     return f"{dt.strftime('%A')} - {dt.strftime('%I:%M %p').lstrip('0')}"
+
+
+def allocation_cycle_caption(summary):
+    start = pd.Timestamp(summary["starts_at"])
+    end = pd.Timestamp(summary["ends_at"])
+    date_range = start.strftime("%d %b") if start.date() == end.date() else f"{start.strftime('%d %b')} \u2013 {end.strftime('%d %b')}"
+    return f"Current allocation: {date_range} | {summary['match_count']} matches"
 
 
 def device_bridge(token_to_store=None, forget=False):
@@ -483,6 +491,11 @@ def render_admin(db):
                     st.rerun()
     with allocation:
         st.subheader("Allocation Review")
+        allocation_summary = current_allocation_summary(db)
+        if allocation_summary:
+            st.caption(allocation_cycle_caption(allocation_summary))
+        else:
+            st.info("No current allocation is being prepared.")
         left, right, confirm_all_col = st.columns(3)
         if left.button("Generate proposed allocation", use_container_width=True):
             propose(db)
@@ -579,7 +592,10 @@ def render_admin(db):
                             except ValueError as error:
                                 st.error(str(error))
     with board_tab:
-        st.subheader("Final Allocation Board")
+        st.subheader("Current Allocation Board")
+        allocation_summary = current_allocation_summary(db)
+        if allocation_summary:
+            st.caption(allocation_cycle_caption(allocation_summary))
         replacements = rows(db, """
             SELECT a.fixture_id,a.role,a.person_id,p.name,f.starts_at,f.home_team,f.away_team
             FROM assignments a JOIN people p ON p.id=a.person_id JOIN fixtures f ON f.id=a.fixture_id
@@ -607,7 +623,10 @@ def render_admin(db):
                         st.rerun()
         board_rows = allocation_board(db)
         if not board_rows:
-            st.info("Generate proposed allocations first to populate the board.")
+            if allocation_summary:
+                st.info("Generate proposed allocations first to populate the board.")
+            else:
+                st.info("No current allocation is being prepared.")
         else:
             active_names = [person["name"] for person in rows(db, "SELECT name FROM people WHERE active=true ORDER BY name")]
             board_frame = pd.DataFrame(board_rows)
@@ -634,6 +653,19 @@ def render_admin(db):
             st.image(png, use_container_width=True)
             st.download_button("Download PNG", png, "sgia-official-allocation.png", "image/png")
             st.download_button("Download Board CSV", edited_board[BOARD_COLUMNS].to_csv(index=False), "sgia-allocation-board.csv", "text/csv")
+        published_cycles = published_allocation_cycles(db)
+        if published_cycles:
+            with st.expander("Published Allocations"):
+                labels = {
+                    f"{pd.Timestamp(cycle['starts_at']).strftime('%d %b %Y')} \u2013 {pd.Timestamp(cycle['ends_at']).strftime('%d %b %Y')} | {cycle['match_count']} matches": cycle
+                    for cycle in published_cycles
+                }
+                published_label = st.selectbox("Published cycle", list(labels), key="published_allocation_cycle")
+                published_board = allocation_board(db, confirmed_only=True, cycle_id=labels[published_label]["id"])
+                if published_board:
+                    st.dataframe(pd.DataFrame(published_board)[BOARD_COLUMNS], hide_index=True, use_container_width=True)
+                else:
+                    st.info("This published cycle has no confirmed allocation rows.")
     with people_tab:
         roster = rows(db, "SELECT id,name,can_umpire,can_score,preferred_role,active,CASE WHEN pin_hash IS NULL THEN 'NOT SET' ELSE 'SET' END pin_status FROM people ORDER BY name")
         edited = st.data_editor(pd.DataFrame(roster), disabled=["id", "pin_status"], hide_index=True, num_rows="dynamic")
@@ -723,9 +755,13 @@ def render_admin(db):
             st.info("No match status events recorded yet.")
     with output:
         st.subheader("Final Confirmed Allocation")
-        st.caption("Exports include only complete, current assignments that have been confirmed.")
-        final_board = confirmed_allocation_board(db)
-        if not final_board:
+        allocation_summary = current_allocation_summary(db)
+        if allocation_summary:
+            st.caption(allocation_cycle_caption(allocation_summary) + ". Exports include only complete confirmed assignments in this batch.")
+        final_board = confirmed_allocation_board(db, cycle_id=allocation_summary["id"]) if allocation_summary else []
+        if not allocation_summary:
+            st.info("No current allocation is being prepared.")
+        elif not final_board:
             st.info("No complete confirmed fixture allocations are ready for export.")
         else:
             if st.button("Regenerate preview", use_container_width=True):
@@ -737,7 +773,7 @@ def render_admin(db):
             png_col.download_button("Download PNG", final_png, "sgia-official-allocation.png", "image/png", use_container_width=True)
             csv_col.download_button("Download CSV", allocation_board_csv(final_board), "sgia-official-allocation.csv", "text/csv", use_container_width=True)
         st.markdown("#### WhatsApp text")
-        message = allocation_message(db)
+        message = allocation_message(db, cycle_id=allocation_summary["id"]) if allocation_summary else "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
         st.text_area("Copy WhatsApp Message", message, height=360)
 
 

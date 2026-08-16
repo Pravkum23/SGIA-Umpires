@@ -94,6 +94,47 @@ def ensure_open_cycle(connection):
     return cycle
 
 
+def ensure_allocation_cycle(connection):
+    """Attach legacy unscoped availability to one working allocation cycle.
+
+    New data is always scoped when the poll opens. This fallback exists only
+    for databases/integrations created before poll_cycle_id was introduced.
+    It runs only when there is no current unpublished cycle.
+    """
+    from src.allocation_scope import current_allocation_cycle
+
+    cycle = current_allocation_cycle(connection)
+    if cycle:
+        return cycle
+    open_cycle = ensure_open_cycle(connection)
+    if open_cycle:
+        return open_cycle
+    candidates = list(connection.execute(text("""
+        SELECT f.id,f.poll_state FROM fixtures f
+        WHERE f.poll_cycle_id IS NULL
+          AND f.poll_state IN ('FROZEN','CLOSED')
+          AND EXISTS (SELECT 1 FROM availability a WHERE a.fixture_id=f.id)
+          AND NOT EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id)
+        ORDER BY CASE f.poll_state WHEN 'FROZEN' THEN 1 ELSE 2 END,
+                 f.starts_at
+    """)).mappings())
+    if not candidates:
+        return None
+    preferred_state = candidates[0].poll_state
+    selected = [row.id for row in candidates if row.poll_state == preferred_state]
+    cycle_id = _insert_cycle(connection, "FROZEN")
+    for fixture_id in selected:
+        connection.execute(text("""
+            UPDATE fixtures SET poll_cycle_id=:cycle,poll_state='FROZEN',availability_open=false
+            WHERE id=:fixture
+        """), {
+            "cycle": cycle_id, "fixture": fixture_id,
+        })
+    return connection.execute(text("SELECT id,status,revision FROM poll_cycles WHERE id=:cycle"), {
+        "cycle": cycle_id,
+    }).mappings().first()
+
+
 def update_open_slots(engine, fixture_ids):
     """Replace the OPEN fixture set without changing the cycle identity."""
     desired_input = {int(value) for value in fixture_ids}
@@ -180,10 +221,11 @@ def transition_poll_state(engine, source, target):
         raise ValueError("Unsupported poll transition")
     with engine.begin() as connection:
         cycle = current_cycle(connection, (source,))
-        connection.execute(text("""
-            UPDATE fixtures SET poll_state=:target,availability_open=false WHERE poll_state=:source
-        """), {"source": source, "target": target})
         if cycle:
+            connection.execute(text("""
+                UPDATE fixtures SET poll_state=:target,availability_open=false
+                WHERE poll_state=:source AND poll_cycle_id=:cycle
+            """), {"source": source, "target": target, "cycle": cycle.id})
             timestamp = "frozen_at" if target == "FROZEN" else "published_at"
             connection.execute(text(f"UPDATE poll_cycles SET status=:target,{timestamp}=CURRENT_TIMESTAMP WHERE id=:cycle"), {
                 "target": target, "cycle": cycle.id,

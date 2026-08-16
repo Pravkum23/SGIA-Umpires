@@ -1,9 +1,12 @@
+from io import BytesIO
 from pathlib import Path
 
+from PIL import Image
 from sqlalchemy import create_engine, text
 from streamlit.testing.v1 import AppTest
 
 from src.allocation import allocation_message, propose
+from src.allocation_scope import current_allocation_summary, published_allocation_cycles
 from src.board import BOARD_COLUMNS, REVIEW_COLUMNS, _font, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
 from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
@@ -563,10 +566,10 @@ def test_upcoming_requires_future_published_confirmed_active_assignment():
     engine = db()
     people = rows(engine, "SELECT id FROM people ORDER BY id LIMIT 3")
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=1"))
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(1,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[0]["id"]})
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(2,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[1]["id"]})
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(3,'umpire_1',:person,false,'ASSIGNED')"), {"person": people[2]["id"]})
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=12"))
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(12,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[0]["id"]})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(13,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[1]["id"]})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(14,'umpire_1',:person,false,'ASSIGNED')"), {"person": people[2]["id"]})
     assert season_workload(engine, people[0]["id"])[0]["upcoming_duties"] == 1
     assert season_workload(engine, people[1]["id"])[0]["upcoming_duties"] == 0
     assert season_workload(engine, people[2]["id"])[0]["upcoming_duties"] == 0
@@ -576,11 +579,11 @@ def test_withdrawal_does_not_count_and_replacement_credits_current_person():
     engine = db()
     original, replacement = rows(engine, "SELECT id FROM people ORDER BY id LIMIT 2")
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=1"))
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(1,'scorer',:person,true,'ASSIGNED')"), {"person": original["id"]})
-    assert withdraw_assignment(engine, 1, "scorer", original["id"])
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=12"))
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(12,'scorer',:person,true,'ASSIGNED')"), {"person": original["id"]})
+    assert withdraw_assignment(engine, 12, "scorer", original["id"])
     assert season_workload(engine, original["id"])[0]["upcoming_duties"] == 0
-    replace_assignment(engine, 1, "scorer", replacement["id"])
+    replace_assignment(engine, 12, "scorer", replacement["id"])
     assert season_workload(engine, replacement["id"])[0]["upcoming_duties"] == 1
     assert season_workload(engine, original["id"])[0]["upcoming_duties"] == 0
 
@@ -605,9 +608,9 @@ def test_allocator_uses_lower_season_workload_only_as_tiebreaker():
         low = connection.execute(text("SELECT id FROM people WHERE name='Fair Low'")).scalar_one()
         connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED',match_status='COMPLETED' WHERE id=2"))
         connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(2,'umpire_1',:high,true,'ASSIGNED')"), {"high": high})
-        connection.execute(text("INSERT INTO availability(person_id,fixture_id) VALUES(:high,1),(:low,1)"), {"high": high, "low": low})
+        connection.execute(text("INSERT INTO availability(person_id,fixture_id) VALUES(:high,12),(:low,12)"), {"high": high, "low": low})
     propose(engine)
-    chosen = rows(engine, "SELECT person_id,reason FROM assignments WHERE fixture_id=1 AND role='umpire_1'")[0]
+    chosen = rows(engine, "SELECT person_id,reason FROM assignments WHERE fixture_id=12 AND role='umpire_1'")[0]
     assert chosen["person_id"] == low
     assert "season workload" in chosen["reason"].lower()
 
@@ -717,6 +720,80 @@ def test_poll_cycle_is_persistent_and_revisions_track_fixture_changes():
     transition_poll_state(engine, "FROZEN", "PUBLISHED")
     second_cycle = update_open_slots(engine, [12, 13])
     assert second_cycle != first_cycle
+
+
+def test_working_allocation_and_every_export_are_scoped_to_current_cycle():
+    engine = db()
+    people = rows(engine, "SELECT id FROM people WHERE active=true ORDER BY id LIMIT 3")
+
+    old_cycle = update_open_slots(engine, [1])
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO availability(person_id,fixture_id) SELECT id,1 FROM people WHERE active=true"))
+    transition_poll_state(engine, "OPEN", "FROZEN")
+    propose(engine)
+    assert confirm_all_proposed(engine) == 1
+    old_assignment_count = rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"]
+    transition_poll_state(engine, "FROZEN", "PUBLISHED")
+
+    # A future assigned fixture outside any active cycle must never leak into
+    # the current board or exports merely because it is in the future.
+    with engine.begin() as connection:
+        for role, person in zip(("umpire_1", "umpire_2", "scorer"), people):
+            connection.execute(text("""
+                INSERT INTO assignments(fixture_id,role,person_id,confirmed,reason,status)
+                VALUES(20,:role,:person,true,'Outside cycle','ASSIGNED')
+            """), {"role": role, "person": person["id"]})
+
+    assert allocation_board(engine) == []
+    assert confirmed_allocation_board(engine) == []
+    assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"] == old_assignment_count
+
+    current_cycle = update_open_slots(engine, [12])
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO availability(person_id,fixture_id) SELECT id,12 FROM people WHERE active=true"))
+    transition_poll_state(engine, "OPEN", "FROZEN")
+    propose(engine)
+    assert confirm_all_proposed(engine) == 1
+
+    summary = current_allocation_summary(engine)
+    assert summary["id"] == current_cycle
+    assert summary["status"] == "FROZEN"
+    assert summary["match_count"] == 1
+    current_rows = confirmed_allocation_board(engine)
+    assert [item["fixture_id"] for item in current_rows] == [12]
+    current_fixture = rows(engine, "SELECT home_team,away_team FROM fixtures WHERE id=12")[0]
+    old_fixture = rows(engine, "SELECT home_team FROM fixtures WHERE id=1")[0]
+    outside_fixture = rows(engine, "SELECT home_team FROM fixtures WHERE id=20")[0]
+
+    csv_output = allocation_board_csv(current_rows)
+    message = allocation_message(engine)
+    assert current_fixture["home_team"] in csv_output and current_fixture["home_team"] in message
+    assert old_fixture["home_team"] not in csv_output and old_fixture["home_team"] not in message
+    assert outside_fixture["home_team"] not in csv_output and outside_fixture["home_team"] not in message
+    png = Image.open(BytesIO(allocation_board_png(current_rows)))
+    assert png.height == 116 + 72 + 86 + 34  # exactly one exported match row
+
+    published_ids = {cycle["id"] for cycle in published_allocation_cycles(engine)}
+    assert old_cycle in published_ids
+    assert rows(engine, "SELECT COUNT(*) n FROM assignments WHERE fixture_id=1")[0]["n"] == old_assignment_count
+
+    transition_poll_state(engine, "FROZEN", "PUBLISHED")
+    assert allocation_board(engine) == []
+    next_cycle = update_open_slots(engine, [20])
+    assert next_cycle not in {old_cycle, current_cycle}
+    assert current_allocation_summary(engine)["id"] == next_cycle
+    assert [item["fixture_id"] for item in allocation_board(engine)] == [20]
+
+
+def test_frozen_cycle_takes_priority_then_open_cycle_becomes_current_after_publish():
+    engine = db()
+    frozen_cycle = update_open_slots(engine, [1])
+    transition_poll_state(engine, "OPEN", "FROZEN")
+    open_cycle = update_open_slots(engine, [12])
+    assert open_cycle != frozen_cycle
+    assert current_allocation_summary(engine)["id"] == frozen_cycle
+    transition_poll_state(engine, "FROZEN", "PUBLISHED")
+    assert current_allocation_summary(engine)["id"] == open_cycle
 
 
 def test_view_and_submission_evidence_is_durable_and_snapshot_complete():
