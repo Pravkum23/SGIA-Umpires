@@ -424,8 +424,23 @@ def test_admin_query_route_still_renders_login(monkeypatch, tmp_path):
     next(item for item in page.button if item.label == "Sign in").click()
     page.run(timeout=20)
     assert not list(page.exception)
-    labels = {tab.label for tab in page.tabs}
-    assert {"Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"} <= labels
+    navigation = next(item for item in page.radio if item.label == "Admin section")
+    assert set(navigation.options) == {
+        "Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board",
+        "People", "Season Workload", "History", "Output",
+    }
+    navigation.set_value("Allocations")
+    page.run(timeout=20)
+    assert not list(page.exception)
+    assert any(item.value == "Allocation Review" for item in page.subheader)
+
+
+def test_admin_navigation_renders_only_the_selected_section():
+    source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+    assert 'admin_section = st.radio(' in source
+    assert 'st.tabs(["Quick Admin", "Open Poll"' not in source
+    for section in ("Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"):
+        assert f'if admin_section == "{section}":' in source
 
 
 def test_confirmed_allocation_message():

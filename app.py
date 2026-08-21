@@ -51,7 +51,7 @@ div[data-testid="stExpander"]{background:#122b26;border:1px solid #31534c;border
 </style>"""
 
 ADMIN_CSS = """<style>
-.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}.live-title{font-size:1.15rem;font-weight:850;letter-spacing:.04em;margin-top:4px}.live-sub{font-size:.72rem;color:#667085}.live-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:11px 12px;margin:8px 0 12px}.live-ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.coverage-covered{color:#067647;font-weight:800}.coverage-warning{color:#b54708;font-weight:800}.match-live{border-left:4px solid #98a2b3;padding-left:10px;margin:7px 0}.match-live strong{font-size:1rem}.match-people{font-size:.78rem;color:#475467;margin-top:5px}.st-key-mobile_allocation_review{display:none}
+.block-container{max-width:1180px;padding-top:1.2rem}.admin-brand{display:flex;align-items:center;gap:12px;margin-bottom:15px}.admin-brand img{width:58px;height:58px;object-fit:contain}.brand-title{font-size:1.4rem;font-weight:800}.brand-sub{font-size:.72rem;color:#667085;letter-spacing:.08em}.match-badge{display:inline-block;border-radius:14px;padding:4px 9px;font-size:.7rem;font-weight:800;letter-spacing:.04em}.status-scheduled{background:#e9eef5;color:#344054}.status-completed{background:#d1fadf;color:#05603a}.status-cancelled{background:#fee4e2;color:#b42318}.live-title{font-size:1.15rem;font-weight:850;letter-spacing:.04em;margin-top:4px}.live-sub{font-size:.72rem;color:#667085}.live-alert{background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:11px 12px;margin:8px 0 12px}.live-ok{background:#ecfdf3;border-color:#abefc6;color:#067647}.coverage-covered{color:#067647;font-weight:800}.coverage-warning{color:#b54708;font-weight:800}.match-live{border-left:4px solid #98a2b3;padding-left:10px;margin:7px 0}.match-live strong{font-size:1rem}.match-people{font-size:.78rem;color:#475467;margin-top:5px}.st-key-mobile_allocation_review{display:none}.st-key-admin_navigation [role="radiogroup"]{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:.15rem;border-bottom:1px solid #344054;padding-bottom:.15rem}.st-key-admin_navigation [role="radiogroup"] label{min-width:max-content;padding:.3rem .55rem}
 @media(max-width:700px){.block-container{padding:.7rem .65rem 2rem!important}.stButton>button,.stDownloadButton>button{width:100%!important;min-height:46px!important}.quick-card{border:1px solid #d0d5dd;border-radius:13px;padding:12px;margin:7px 0;background:#f8fafc}.quick-number{font-size:1.55rem;font-weight:800}.quick-label{font-size:.72rem;color:#667085;text-transform:uppercase}.stTabs [data-baseweb="tab-list"]{overflow-x:auto}.stTabs [data-baseweb="tab"]{min-width:max-content}.st-key-desktop_allocation_review{display:none!important}.st-key-mobile_allocation_review{display:block!important}}
 </style>"""
 
@@ -238,8 +238,17 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
-    quick_tab, control, fixtures_tab, allocation, board_tab, people_tab, workload_tab, history_tab, output = st.tabs(["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"])
-    with quick_tab:
+    # Streamlit tabs eagerly execute every panel on every widget interaction.
+    # Conditional navigation keeps Supabase work limited to the visible page.
+    admin_sections = ["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"]
+    admin_section = st.radio(
+        "Admin section",
+        admin_sections,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="admin_navigation",
+    )
+    if admin_section == "Quick Admin":
         st.subheader("Quick Admin")
         live = live_poll_monitor(db)
         refresh_col, refreshed_col = st.columns([1, 1])
@@ -339,12 +348,15 @@ def render_admin(db):
                         f'<div class="match-people">{names}</div></div>',
                         unsafe_allow_html=True,
                     )
-        upcoming = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP")[0]["count"]
-        open_count = rows(db, "SELECT COUNT(*) count FROM fixtures WHERE poll_state='OPEN'")[0]["count"]
-        responses = rows(db, "SELECT COUNT(DISTINCT person_id) count FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.poll_state IN ('OPEN','FROZEN')")[0]["count"]
-        required = rows(db, "SELECT COUNT(*) count FROM assignments WHERE status='REPLACEMENT_REQUIRED'")[0]["count"]
+        quick_counts = rows(db, """
+            SELECT
+              (SELECT COUNT(*) FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP) upcoming,
+              (SELECT COUNT(*) FROM fixtures WHERE poll_state='OPEN') open_count,
+              (SELECT COUNT(DISTINCT person_id) FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.poll_state IN ('OPEN','FROZEN')) responses,
+              (SELECT COUNT(*) FROM assignments WHERE status='REPLACEMENT_REQUIRED') required
+        """)[0]
         cards = st.columns(2)
-        for index, (value, label) in enumerate(((upcoming,"Upcoming Matches"),(open_count,"Open Poll"),(responses,"With Availability"),(required,"Replacement Required"))):
+        for index, (value, label) in enumerate(((quick_counts["upcoming"],"Upcoming Matches"),(quick_counts["open_count"],"Open Poll"),(quick_counts["responses"],"With Availability"),(quick_counts["required"],"Replacement Required"))):
             cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
         st.markdown("#### Season workload")
         for person in season_workload(db)[:5]:
@@ -418,7 +430,7 @@ def render_admin(db):
             st.download_button("DOWNLOAD PNG",quick_png,"sgia-official-allocation.png","image/png",key="quick_png")
             st.download_button("DOWNLOAD CSV",pd.DataFrame(quick_board)[BOARD_COLUMNS].to_csv(index=False),"sgia-allocation.csv","text/csv",key="quick_csv")
             st.text_area("COPY WHATSAPP MESSAGE",allocation_message(db),height=220,key="quick_whatsapp")
-    with control:
+    if admin_section == "Open Poll":
         fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
         state_counts = rows(db, "SELECT poll_state,COUNT(*) count FROM fixtures GROUP BY poll_state")
         st.caption(" · ".join(f"{item['poll_state']}: {item['count']}" for item in state_counts))
@@ -443,7 +455,7 @@ def render_admin(db):
             update_open_slots(db, opened)
             st.success("Open slots updated")
             st.rerun()
-    with fixtures_tab:
+    if admin_section == "Fixtures":
         st.subheader("Fixture Manager")
         add_section, edit_section, bulk_section = st.tabs(["Add Fixture", "Edit Fixture", "Bulk Import"])
         with add_section:
@@ -489,7 +501,7 @@ def render_admin(db):
                     st.success(f"Imported {imported} fixture(s). Duplicates and invalid rows were skipped.")
                     st.session_state.fixture_preview = []
                     st.rerun()
-    with allocation:
+    if admin_section == "Allocations":
         st.subheader("Allocation Review")
         allocation_summary = current_allocation_summary(db)
         if allocation_summary:
@@ -591,7 +603,7 @@ def render_admin(db):
                                 st.rerun()
                             except ValueError as error:
                                 st.error(str(error))
-    with board_tab:
+    if admin_section == "Allocation Board":
         st.subheader("Current Allocation Board")
         allocation_summary = current_allocation_summary(db)
         if allocation_summary:
@@ -666,7 +678,7 @@ def render_admin(db):
                     st.dataframe(pd.DataFrame(published_board)[BOARD_COLUMNS], hide_index=True, use_container_width=True)
                 else:
                     st.info("This published cycle has no confirmed allocation rows.")
-    with people_tab:
+    if admin_section == "People":
         roster = rows(db, "SELECT id,name,can_umpire,can_score,preferred_role,active,CASE WHEN pin_hash IS NULL THEN 'NOT SET' ELSE 'SET' END pin_status FROM people ORDER BY name")
         edited = st.data_editor(pd.DataFrame(roster), disabled=["id", "pin_status"], hide_index=True, num_rows="dynamic")
         if st.button("Save people"):
@@ -694,7 +706,7 @@ def render_admin(db):
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
-    with workload_tab:
+    if admin_section == "Season Workload":
         st.subheader("Season Workload")
         st.caption("Completed work counts only confirmed, active duties on matches marked COMPLETED. Workload is used only as an allocation tie-breaker.")
         workload_search = st.text_input("Search person", key="workload_search").strip().lower()
@@ -719,7 +731,7 @@ def render_admin(db):
                 )
         else:
             st.info("No active people match this search.")
-    with history_tab:
+    if admin_section == "History":
         st.subheader("Assignment History")
         history = assignment_history(db)
         if not history:
@@ -753,7 +765,7 @@ def render_admin(db):
             } for item in match_history]), hide_index=True, use_container_width=True)
         else:
             st.info("No match status events recorded yet.")
-    with output:
+    if admin_section == "Output":
         st.subheader("Final Confirmed Allocation")
         allocation_summary = current_allocation_summary(db)
         if allocation_summary:
