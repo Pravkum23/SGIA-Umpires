@@ -16,7 +16,18 @@ from src.allocation import allocation_message, propose
 from src.allocation_scope import current_allocation_summary, published_allocation_cycles
 from src.board import BOARD_COLUMNS, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import get_engine, initialize, rows, save_vote
-from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
+from src.fixtures import (
+    PREVIEW_COLUMNS,
+    add_fixture,
+    current_fixtures_csv,
+    current_fixtures_xlsx,
+    edit_fixture,
+    fixture_template_csv,
+    fixture_template_xlsx,
+    import_bulk_fixtures,
+    preview_bulk_fixtures,
+    preview_fixture_file,
+)
 from src.lifecycle import assignment_history, authenticate_person, confirm_assignment, forget_person, person_for_token, pin_status, published_duties, replace_assignment, set_person_pin, suggest_replacement, withdraw_assignment
 from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
@@ -457,8 +468,14 @@ def render_admin(db):
             st.rerun()
     if admin_section == "Fixtures":
         st.subheader("Fixture Manager")
-        add_section, edit_section, bulk_section = st.tabs(["Add Fixture", "Edit Fixture", "Bulk Import"])
-        with add_section:
+        fixture_section = st.radio(
+            "Fixture action",
+            ["Add Fixture", "Edit Fixture", "Bulk Import"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="fixture_navigation",
+        )
+        if fixture_section == "Add Fixture":
             add_date = st.text_input("Date", placeholder="22-Aug-2026", key="fixture_add_date")
             add_time = st.text_input("Time", placeholder="11:00 AM", key="fixture_add_time")
             add_team_1 = st.text_input("TEAM 1", key="fixture_add_team_1")
@@ -471,7 +488,7 @@ def render_admin(db):
                         st.warning("Duplicate fixture was not added.")
                 except ValueError as error:
                     st.error(str(error))
-        with edit_section:
+        if fixture_section == "Edit Fixture":
             fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures ORDER BY starts_at")
             fixture_labels = {f"{pd.Timestamp(item['starts_at']).strftime('%d-%b-%Y %I:%M %p')} · {item['home_team']} vs {item['away_team']}": item for item in fixture_options}
             selected_label = st.selectbox("Fixture", list(fixture_labels), key="fixture_edit_select")
@@ -489,18 +506,80 @@ def render_admin(db):
                         st.rerun()
                     except Exception as error:
                         st.error(f"Fixture could not be updated: {error}")
-        with bulk_section:
-            bulk_text = st.text_area("Paste fixtures", placeholder="Day | Date | Time | TEAM 1 | TEAM 2\nSaturday | 05-Sep-2026 | 11:00 AM | Team A | Team B", height=180)
-            if st.button("Preview Bulk Import"):
+        if fixture_section == "Bulk Import":
+            st.subheader("Fixture Bulk Import")
+            st.markdown("**1. Download Template  \n2. Fill Schedule  \n3. Upload File  \n4. Preview  \n5. Import Ready Fixtures**")
+            template_csv_col, template_xlsx_col = st.columns(2)
+            template_csv_col.download_button(
+                "DOWNLOAD CSV TEMPLATE",
+                fixture_template_csv(),
+                "sgia-fixture-template.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+            template_xlsx_col.download_button(
+                "DOWNLOAD EXCEL TEMPLATE",
+                fixture_template_xlsx(),
+                "sgia-fixture-template.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            current_csv_col, current_xlsx_col = st.columns(2)
+            current_csv_col.download_button(
+                "DOWNLOAD CURRENT FIXTURES CSV",
+                current_fixtures_csv(db),
+                "sgia-current-fixtures.csv",
+                "text/csv",
+                use_container_width=True,
+            )
+            current_xlsx_col.download_button(
+                "DOWNLOAD CURRENT FIXTURES EXCEL",
+                current_fixtures_xlsx(db),
+                "sgia-current-fixtures.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            uploaded_fixture_file = st.file_uploader(
+                "UPLOAD FIXTURE FILE",
+                type=["csv", "xlsx"],
+                help="Upload the completed CSV or Excel template. Existing fixture times will be marked DUPLICATE.",
+            )
+            if uploaded_fixture_file and st.button("PREVIEW UPLOADED FILE", type="primary", use_container_width=True):
+                try:
+                    st.session_state.fixture_preview = preview_fixture_file(
+                        db, uploaded_fixture_file.name, uploaded_fixture_file.getvalue()
+                    )
+                except Exception as error:
+                    st.session_state.fixture_preview = [{
+                        "Line": 1, "Day": "", "Date": "", "Time": "", "TEAM 1": "", "TEAM 2": "",
+                        "Status": "ERROR", "Error": f"File could not be read: {error}",
+                    }]
+            st.markdown("#### OR Paste from Excel / Text")
+            st.caption("Paste pipe-separated text, tab-separated rows copied from Excel/Google Sheets, or CSV. Day is optional.")
+            bulk_text = st.text_area(
+                "Paste fixtures",
+                placeholder="Day | Date | Time | TEAM 1 | TEAM 2\nSaturday | 05-Sep-2026 | 11:00 AM | Team A | Team B",
+                height=180,
+            )
+            if st.button("PREVIEW PASTED FIXTURES", use_container_width=True):
                 st.session_state.fixture_preview = preview_bulk_fixtures(db, bulk_text)
             fixture_preview = st.session_state.get("fixture_preview", [])
             if fixture_preview:
-                st.dataframe(pd.DataFrame([{key: value for key, value in item.items() if key != "starts_at"} for item in fixture_preview]), hide_index=True, use_container_width=True)
-                if st.button("Import Ready Fixtures"):
+                preview_frame = pd.DataFrame(fixture_preview)
+                for column in PREVIEW_COLUMNS:
+                    if column not in preview_frame:
+                        preview_frame[column] = ""
+                st.markdown("#### Preview")
+                st.dataframe(preview_frame[PREVIEW_COLUMNS], hide_index=True, use_container_width=True)
+                ready = sum(item.get("Status") == "READY" for item in fixture_preview)
+                duplicates = sum(item.get("Status") == "DUPLICATE" for item in fixture_preview)
+                errors = sum(item.get("Status") == "ERROR" for item in fixture_preview)
+                st.caption(f"READY: {ready} · DUPLICATE: {duplicates} · ERROR: {errors}")
+                if st.button("IMPORT READY FIXTURES", type="primary", use_container_width=True, disabled=ready == 0):
                     imported = import_bulk_fixtures(db, fixture_preview)
-                    st.success(f"Imported {imported} fixture(s). Duplicates and invalid rows were skipped.")
+                    duplicates += max(ready - imported, 0)
+                    st.success(f"Imported: {imported} · Duplicates skipped: {duplicates} · Errors: {errors}")
                     st.session_state.fixture_preview = []
-                    st.rerun()
     if admin_section == "Allocations":
         st.subheader("Allocation Review")
         allocation_summary = current_allocation_summary(db)

@@ -1,6 +1,8 @@
 from io import BytesIO
 from pathlib import Path
+from datetime import date, datetime, time
 
+from openpyxl import Workbook, load_workbook
 from PIL import Image
 from sqlalchemy import create_engine, text
 from streamlit.testing.v1 import AppTest
@@ -9,7 +11,19 @@ from src.allocation import allocation_message, propose
 from src.allocation_scope import current_allocation_summary, published_allocation_cycles
 from src.board import BOARD_COLUMNS, REVIEW_COLUMNS, _font, allocation_board, allocation_board_csv, allocation_board_png, allocation_review, confirm_all_proposed, confirmed_allocation_board, save_allocation_board, save_allocation_review
 from src.db import POSTGRES_SCHEMA, SQLITE_SCHEMA, initialize, people_seed_params, rows, save_vote, schema_for
-from src.fixtures import add_fixture, edit_fixture, import_bulk_fixtures, preview_bulk_fixtures
+from src.fixtures import (
+    CURRENT_FIXTURE_COLUMNS,
+    FIXTURE_COLUMNS,
+    current_fixtures_csv,
+    current_fixtures_xlsx,
+    add_fixture,
+    edit_fixture,
+    fixture_template_csv,
+    fixture_template_xlsx,
+    import_bulk_fixtures,
+    preview_bulk_fixtures,
+    preview_fixture_file,
+)
 from src.lifecycle import authenticate_person, availability_for_person, forget_person, person_for_token, remember_person, replace_assignment, set_person_pin, suggest_replacement, verify_person_pin, withdraw_assignment
 from src.live_poll import coverage_status, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
@@ -433,6 +447,14 @@ def test_admin_query_route_still_renders_login(monkeypatch, tmp_path):
     page.run(timeout=20)
     assert not list(page.exception)
     assert any(item.value == "Allocation Review" for item in page.subheader)
+    next(item for item in page.radio if item.label == "Admin section").set_value("Fixtures")
+    page.run(timeout=20)
+    next(item for item in page.radio if item.label == "Fixture action").set_value("Bulk Import")
+    page.run(timeout=20)
+    assert not list(page.exception)
+    assert any(item.label == "UPLOAD FIXTURE FILE" for item in page.file_uploader)
+    download_labels = {item.label for item in page.get("download_button")}
+    assert {"DOWNLOAD CSV TEMPLATE", "DOWNLOAD EXCEL TEMPLATE"} <= download_labels
 
 
 def test_admin_navigation_renders_only_the_selected_section():
@@ -505,6 +527,113 @@ Sunday | 06-Sep-2026 | 3:00 PM | Duplicate In Paste | Team E"""
     assert [item["Status"] for item in preview] == ["DUPLICATE", "READY", "DUPLICATE"]
     assert import_bulk_fixtures(engine, preview) == 1
     assert import_bulk_fixtures(engine, preview) == 0
+
+
+def test_fixture_csv_and_excel_templates_are_real_and_formatted():
+    csv_text = fixture_template_csv().decode("utf-8-sig")
+    assert csv_text.splitlines()[0] == ",".join(FIXTURE_COLUMNS)
+    assert "Changi Risers" in csv_text and "Knights United" in csv_text
+
+    workbook = load_workbook(BytesIO(fixture_template_xlsx()))
+    sheet = workbook.active
+    assert [cell.value for cell in sheet[1]] == FIXTURE_COLUMNS
+    assert all(cell.font.bold for cell in sheet[1])
+    assert sheet.freeze_panes == "A2"
+    assert sheet.column_dimensions["D"].width >= 20
+    assert isinstance(sheet["B2"].value, (date, datetime))
+    assert isinstance(sheet["C2"].value, (time, datetime))
+    assert sheet["A2"].comment and "Example row" in sheet["A2"].comment.text
+
+
+def test_csv_upload_accepts_alias_headers_optional_day_and_24_hour_time():
+    engine = db()
+    uploaded = (
+        "Date,Time,Home Team,Away Team\n"
+        "15/09/2026,19:00,Warriors,Legends\n"
+        "2026-09-16,7:30 AM,Team Alpha,Team Beta\n"
+    ).encode("utf-8")
+    preview = preview_fixture_file(engine, "schedule.csv", uploaded)
+    assert [item["Status"] for item in preview] == ["READY", "READY"]
+    assert preview[0]["Day"] == "Tuesday"
+    assert preview[0]["starts_at"] == datetime(2026, 9, 15, 19, 0)
+    assert preview[1]["starts_at"] == datetime(2026, 9, 16, 7, 30)
+
+
+def test_xlsx_upload_accepts_excel_date_and_time_cells_without_timezone_shift():
+    engine = db()
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Date", "Time", "Team 1", "Team 2"])
+    sheet.append([date(2026, 9, 17), time(15, 0), "Excel XI", "Spreadsheet XI"])
+    payload = BytesIO()
+    workbook.save(payload)
+    preview = preview_fixture_file(engine, "schedule.xlsx", payload.getvalue())
+    assert len(preview) == 1 and preview[0]["Status"] == "READY"
+    assert preview[0]["Day"] == "Thursday"
+    assert preview[0]["Date"] == "17-Sep-2026"
+    assert preview[0]["Time"] == "3:00 PM"
+    assert preview[0]["starts_at"] == datetime(2026, 9, 17, 15, 0)
+    assert preview[0]["starts_at"].tzinfo is None
+
+
+def test_pipe_tab_and_csv_paste_share_preview_and_do_not_split_team_spaces():
+    engine = db()
+    pipe_preview = preview_bulk_fixtures(
+        engine, "Day | Date | Time | TEAM 1 | TEAM 2\nFriday | 18-Sep-2026 | 7:00 PM | United Warriors | Royal Legends"
+    )
+    tab_preview = preview_bulk_fixtures(
+        engine, "Tuesday\t22-Sep-2026\t7:00 PM\tWarriors United\tLegends United"
+    )
+    csv_preview = preview_bulk_fixtures(
+        engine, "Date,Time,Team 1,Team 2\n2026-09-23,19:00,Comma Warriors,Comma Legends"
+    )
+    assert pipe_preview[0]["TEAM 1"] == "United Warriors"
+    assert tab_preview[0]["Status"] == "READY"
+    assert tab_preview[0]["TEAM 2"] == "Legends United"
+    assert csv_preview[0]["Status"] == "READY"
+    unsafe_spaces = preview_bulk_fixtures(engine, "23-Sep-2026 7:00 PM Team With Spaces Other Team")
+    assert unsafe_spaces[0]["Status"] == "ERROR"
+    assert "spaces cannot safely separate" in unsafe_spaces[0]["Error"]
+
+
+def test_mixed_batch_classifies_ready_duplicate_error_and_never_overwrites():
+    engine = db()
+    original = rows(engine, "SELECT id,home_team,away_team FROM fixtures WHERE id=1")[0]
+    batch = """Date,Time,Home Team,Away Team
+15-Aug-2026,11:00 AM,Overwrite Attempt,Must Not Replace
+24-Sep-2026,7:00 PM,Ready Team,Ready Opponent
+24-Sep-2026,7:00 PM,Repeated Ready Time,Also Duplicate
+not-a-date,3:00 PM,Broken,Row"""
+    preview = preview_fixture_file(engine, "mixed.csv", batch.encode())
+    assert [item["Status"] for item in preview] == ["DUPLICATE", "READY", "DUPLICATE", "ERROR"]
+    assert import_bulk_fixtures(engine, preview) == 1
+    assert import_bulk_fixtures(engine, preview) == 0
+    unchanged = rows(engine, "SELECT id,home_team,away_team FROM fixtures WHERE id=1")[0]
+    assert unchanged == original
+    assert rows(engine, "SELECT COUNT(*) n FROM fixtures WHERE starts_at='2026-09-24 19:00:00'")[0]["n"] == 1
+
+
+def test_invalid_file_headers_are_reported_and_current_fixture_exports_are_safe():
+    engine = db()
+    invalid = preview_fixture_file(engine, "bad.csv", b"Date,Time,Home Team\n2026-09-25,19:00,Only One Team")
+    assert invalid[0]["Status"] == "ERROR"
+    assert "Missing required column" in invalid[0]["Error"]
+
+    csv_header = current_fixtures_csv(engine).decode("utf-8-sig").splitlines()[0]
+    assert csv_header == ",".join(CURRENT_FIXTURE_COLUMNS)
+    workbook = load_workbook(BytesIO(current_fixtures_xlsx(engine)), read_only=True)
+    assert [cell.value for cell in workbook.active[1]] == CURRENT_FIXTURE_COLUMNS
+    assert workbook.active.max_row == 30
+
+
+def test_fixture_bulk_import_admin_contract_is_visible():
+    source = (Path(__file__).parents[1] / "app.py").read_text(encoding="utf-8")
+    for label in (
+        "Fixture Bulk Import", "DOWNLOAD CSV TEMPLATE", "DOWNLOAD EXCEL TEMPLATE",
+        "UPLOAD FIXTURE FILE", "OR Paste from Excel / Text", "IMPORT READY FIXTURES",
+        "DOWNLOAD CURRENT FIXTURES CSV", "DOWNLOAD CURRENT FIXTURES EXCEL",
+    ):
+        assert label in source
 
 
 def test_existing_schema_migration_preserves_data():
@@ -580,11 +709,15 @@ def test_unpublished_fixture_cannot_be_completed():
 def test_upcoming_requires_future_published_confirmed_active_assignment():
     engine = db()
     people = rows(engine, "SELECT id FROM people ORDER BY id LIMIT 3")
+    assert add_fixture(engine, "01-Jan-2099", "11:00 AM", "Future Published", "Future Opponent")
+    assert add_fixture(engine, "02-Jan-2099", "11:00 AM", "Future Unpublished", "Future Opponent")
+    assert add_fixture(engine, "03-Jan-2099", "11:00 AM", "Future Unconfirmed", "Future Opponent")
+    future_ids = [item["id"] for item in rows(engine, "SELECT id FROM fixtures WHERE starts_at>='2099-01-01' ORDER BY starts_at")]
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=12"))
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(12,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[0]["id"]})
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(13,'umpire_1',:person,true,'ASSIGNED')"), {"person": people[1]["id"]})
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(14,'umpire_1',:person,false,'ASSIGNED')"), {"person": people[2]["id"]})
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=:fixture"), {"fixture": future_ids[0]})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(:fixture,'umpire_1',:person,true,'ASSIGNED')"), {"fixture": future_ids[0], "person": people[0]["id"]})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(:fixture,'umpire_1',:person,true,'ASSIGNED')"), {"fixture": future_ids[1], "person": people[1]["id"]})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(:fixture,'umpire_1',:person,false,'ASSIGNED')"), {"fixture": future_ids[2], "person": people[2]["id"]})
     assert season_workload(engine, people[0]["id"])[0]["upcoming_duties"] == 1
     assert season_workload(engine, people[1]["id"])[0]["upcoming_duties"] == 0
     assert season_workload(engine, people[2]["id"])[0]["upcoming_duties"] == 0
@@ -593,12 +726,14 @@ def test_upcoming_requires_future_published_confirmed_active_assignment():
 def test_withdrawal_does_not_count_and_replacement_credits_current_person():
     engine = db()
     original, replacement = rows(engine, "SELECT id FROM people ORDER BY id LIMIT 2")
+    assert add_fixture(engine, "04-Jan-2099", "11:00 AM", "Future Withdrawal", "Future Opponent")
+    fixture_id = rows(engine, "SELECT id FROM fixtures WHERE starts_at='2099-01-04 11:00:00'")[0]["id"]
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=12"))
-        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(12,'scorer',:person,true,'ASSIGNED')"), {"person": original["id"]})
-    assert withdraw_assignment(engine, 12, "scorer", original["id"])
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=:fixture"), {"fixture": fixture_id})
+        connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(:fixture,'scorer',:person,true,'ASSIGNED')"), {"fixture": fixture_id, "person": original["id"]})
+    assert withdraw_assignment(engine, fixture_id, "scorer", original["id"])
     assert season_workload(engine, original["id"])[0]["upcoming_duties"] == 0
-    replace_assignment(engine, 12, "scorer", replacement["id"])
+    replace_assignment(engine, fixture_id, "scorer", replacement["id"])
     assert season_workload(engine, replacement["id"])[0]["upcoming_duties"] == 1
     assert season_workload(engine, original["id"])[0]["upcoming_duties"] == 0
 
