@@ -559,6 +559,22 @@ def test_csv_upload_accepts_alias_headers_optional_day_and_24_hour_time():
     assert preview[1]["starts_at"] == datetime(2026, 9, 16, 7, 30)
 
 
+def test_excel_style_two_digit_year_text_is_accepted_as_current_century():
+    engine = db()
+    pasted = """Day\tDate\tTime\tTEAM 1\tTEAM 2
+Tuesday\t01-Sep-26\t7:00 PM\tTamil Titans\tCenturions
+Wednesday\t02-Sep-26\t7:00 PM\tKarunadu\tCW Storm
+Thursday\t03/09/26\t7:00 PM\tKnights United\tRoyal Star"""
+    preview = preview_bulk_fixtures(engine, pasted)
+    assert [item["Status"] for item in preview] == ["READY", "READY", "READY"]
+    assert [item["starts_at"] for item in preview] == [
+        datetime(2026, 9, 1, 19, 0),
+        datetime(2026, 9, 2, 19, 0),
+        datetime(2026, 9, 3, 19, 0),
+    ]
+    assert [item["Date"] for item in preview] == ["01-Sep-2026", "02-Sep-2026", "03-Sep-2026"]
+
+
 def test_xlsx_upload_accepts_excel_date_and_time_cells_without_timezone_shift():
     engine = db()
     workbook = Workbook()

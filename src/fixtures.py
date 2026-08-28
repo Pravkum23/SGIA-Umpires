@@ -60,6 +60,14 @@ def _parse_date(value):
             return datetime.strptime(raw, pattern).date()
         except ValueError:
             continue
+    for pattern in ("%d-%b-%y", "%d/%m/%y", "%d-%m-%y", "%y-%m-%d"):
+        try:
+            parsed = datetime.strptime(raw, pattern).date()
+            # Spreadsheet schedules use two-digit years for the current
+            # century (for example 01-Sep-26 means 1 September 2026).
+            return parsed.replace(year=parsed.year + 100) if parsed.year < 2000 else parsed
+        except ValueError:
+            continue
     raise ValueError(f"Unsupported date: {raw or 'blank'}")
 
 
