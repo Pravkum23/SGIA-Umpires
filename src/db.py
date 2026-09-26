@@ -44,6 +44,11 @@ def database_url():
     url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL")
     if url and url.startswith("postgres://"):
         url = "postgresql+psycopg2://" + url[len("postgres://"):]
+    elif url and url.startswith("postgresql://"):
+        # SQLAlchemy 2.x resolves a bare "postgresql://" URL to the psycopg (v3)
+        # driver by default, but this project only bundles psycopg2-binary.
+        # Pin the driver explicitly so Supabase-style connection strings work.
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
     return url or f"sqlite:///{Path(os.getenv('SGIA_SQLITE_PATH', 'sgia_umpires.db')).resolve().as_posix()}"
 
 def get_engine(url=None):
