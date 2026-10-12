@@ -68,6 +68,20 @@ ADMIN_CSS = """<style>
 
 st.markdown(ADMIN_CSS if ADMIN_MODE else PUBLIC_CSS, unsafe_allow_html=True)
 
+if ADMIN_MODE:
+    st.markdown("""<style>
+    .block-container{max-width:1280px;padding-bottom:3rem}
+    .brand-title{letter-spacing:-.025em}.brand-sub{letter-spacing:.12em}
+    .quick-card{border:1px solid #64748b40;border-radius:14px;padding:16px;margin:6px 0;background:var(--secondary-background-color)}
+    .quick-number{font-size:1.8rem;font-weight:750;line-height:1.2}
+    .quick-label{font-size:.78rem;opacity:.75;margin-top:5px}
+    .stButton>button,.stDownloadButton>button{border-radius:10px;min-height:42px}
+    .st-key-admin_navigation{padding:8px 0 14px}
+    .st-key-admin_navigation [role="radiogroup"] label{border-radius:8px;padding:8px 12px}
+    .st-key-admin_live_panel{border:1px solid #64748b40;border-radius:16px;padding:16px;margin-bottom:12px;background:var(--secondary-background-color)}
+    @media(max-width:700px){.st-key-admin_live_panel{padding:12px}.quick-number{font-size:1.4rem}}
+    </style>""", unsafe_allow_html=True)
+
 
 @st.cache_resource
 def engine():
@@ -245,10 +259,52 @@ def admin_authenticated():
     return False
 
 
+@st.fragment(run_every="15s")
+def render_admin_live_panel(db):
+    """Refresh only read-only operational data; never rerun an active editor."""
+    with st.container(key="admin_live_panel"):
+        title_col, refresh_col = st.columns([3, 1])
+        title_col.markdown("### Operations overview")
+        refresh_col.button("Refresh status", key="admin_refresh_status", use_container_width=True)
+        try:
+            live = live_poll_monitor(db)
+            replacements = rows(db, "SELECT COUNT(*) n FROM assignments WHERE status='REPLACEMENT_REQUIRED'")[0]["n"]
+        except Exception:
+            st.warning("Live status is temporarily unavailable. Your editing screens remain available; retry Refresh status.")
+            return
+        cards = st.columns(4)
+        for column, (label, value) in zip(cards, (
+            ("Open matches", live["open_matches"]),
+            ("Responses", f'{live["responded"]} / {live["active_volunteers"]}'),
+            ("Awaiting response", len(live["yet_to_respond"])),
+            ("Replacements needed", replacements),
+        )):
+            column.metric(label, value)
+        stamp = datetime.now(ZoneInfo(SGIA_TIMEZONE)).strftime("%d %b · %I:%M:%S %p SGT")
+        st.caption(f"Live status · refreshes every 15 seconds · Last successful update: {stamp}")
+        if replacements:
+            st.warning(f"{replacements} duty assignment(s) need a replacement. Open Allocation Board to resolve them.")
+        if live["needs_review"]:
+            st.info(f'{len(live["needs_review"])} volunteer(s) need to review changed poll slots.')
+        if not live["open_matches"]:
+            st.caption("No poll is currently open. Use Open Poll to prepare the next availability cycle.")
+        else:
+            with st.expander("Live match coverage"):
+                records = [{
+                    "Day": day["label"], "Time": match["time"],
+                    "Match": f'{match["home_team"]} vs {match["away_team"]}',
+                    "Available": match["available_count"], "Coverage": match["coverage"],
+                } for day in live["days"] for match in day["matches"]]
+                st.dataframe(pd.DataFrame(records), hide_index=True, use_container_width=True)
+                if live["yet_to_respond"]:
+                    st.caption("Awaiting response: " + ", ".join(live["yet_to_respond"]))
+
+
 def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
+    render_admin_live_panel(db)
     # Streamlit tabs eagerly execute every panel on every widget interaction.
     # Conditional navigation keeps Supabase work limited to the visible page.
     admin_sections = ["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"]
