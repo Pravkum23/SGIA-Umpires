@@ -29,6 +29,7 @@ from src.live_poll import coverage_status, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
 from src.workload import fixture_history, season_workload, set_match_status
+from src.tournaments import create_tournament
 
 
 def db():
@@ -455,6 +456,11 @@ def test_admin_query_route_still_renders_login(monkeypatch, tmp_path):
     assert any(item.label == "UPLOAD FIXTURE FILE" for item in page.file_uploader)
     download_labels = {item.label for item in page.get("download_button")}
     assert {"DOWNLOAD CSV TEMPLATE", "DOWNLOAD EXCEL TEMPLATE"} <= download_labels
+    next(item for item in page.radio if item.label == "Admin section").set_value("Open Poll")
+    page.run(timeout=20)
+    assert not list(page.exception)
+    assert len(page.checkbox) <= 12
+    assert any(item.label == "From date" for item in page.date_input)
 
 
 def test_admin_navigation_renders_only_the_selected_section():
@@ -886,6 +892,34 @@ def test_poll_cycle_is_persistent_and_revisions_track_fixture_changes():
     transition_poll_state(engine, "FROZEN", "PUBLISHED")
     second_cycle = update_open_slots(engine, [12, 13])
     assert second_cycle != first_cycle
+
+
+def test_filtered_poll_save_preserves_open_slots_on_other_pages():
+    engine = db()
+    cycle = update_open_slots(engine, [1, 2, 12])
+    update_open_slots(engine, [2, 3], visible_fixture_ids=[1, 2, 3])
+    assert [item["id"] for item in rows(engine, "SELECT id FROM fixtures WHERE poll_state='OPEN' ORDER BY id")] == [2, 3, 12]
+    assert rows(engine, "SELECT poll_cycle_id FROM fixtures WHERE id=12")[0]["poll_cycle_id"] == cycle
+    update_open_slots(engine, [], visible_fixture_ids=[2, 3])
+    assert rows(engine, "SELECT id FROM fixtures WHERE poll_state='OPEN'") == [{"id": 12}]
+
+
+def test_tournament_migration_and_new_import_preserve_existing_records():
+    engine = db()
+    before = rows(engine, "SELECT id,starts_at,home_team,away_team FROM fixtures ORDER BY id")
+    update_open_slots(engine, [1])
+    save_vote(engine, 1, [1])
+    create_tournament(engine, "SHL5")
+    create_tournament(engine, "SHL5")
+    preview = preview_bulk_fixtures(engine, "Date,Time,Team 1,Team 2\n01-Nov-2026,11:00 AM,New Team,Other Team", tournament="SHL5")
+    assert import_bulk_fixtures(engine, preview) == 1
+    initialize(engine)
+    assert rows(engine, "SELECT id,starts_at,home_team,away_team FROM fixtures WHERE tournament='SHL4' ORDER BY id") == before
+    assert rows(engine, "SELECT fixture_id FROM availability WHERE person_id=1") == [{"fixture_id": 1}]
+    assert rows(engine, "SELECT COUNT(*) n FROM tournaments WHERE name='SHL5'") == [{"n": 1}]
+    assert b"New Team" in current_fixtures_csv(engine, "SHL5")
+    assert b"Changi Risers" not in current_fixtures_csv(engine, "SHL5")
+    assert b"New Team" not in current_fixtures_csv(engine, "SHL4")
 
 
 def test_working_allocation_and_every_export_are_scoped_to_current_cycle():

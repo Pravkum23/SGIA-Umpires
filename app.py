@@ -3,7 +3,7 @@ import hmac
 import json
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
@@ -33,6 +33,7 @@ from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
 from src.workload import fixture_history, season_workload, set_match_status
+from src.tournaments import create_tournament
 
 st.set_page_config(page_title="SGIA Umpires", page_icon="🏏", layout="wide")
 ADMIN_MODE = is_admin_request(st.query_params)
@@ -77,7 +78,9 @@ if ADMIN_MODE:
     .quick-label{font-size:.78rem;opacity:.75;margin-top:5px}
     .stButton>button,.stDownloadButton>button{border-radius:10px;min-height:42px}
     .st-key-admin_navigation{padding:8px 0 14px}
-    .st-key-admin_navigation [role="radiogroup"] label{border-radius:8px;padding:8px 12px}
+    .st-key-admin_navigation [role="radiogroup"] label{border-radius:8px;padding:8px 12px;border:1px solid #64748b30}
+    .st-key-admin_navigation [role="radiogroup"] label:has(input:checked){border-color:#F4C542;background:#173F78;color:white}
+    .st-key-admin_navigation{border-bottom:2px solid #F4C542;margin-bottom:16px}
     .st-key-admin_live_panel{border:1px solid #64748b40;border-radius:16px;padding:16px;margin-bottom:12px;background:var(--secondary-background-color)}
     @media(max-width:700px){.st-key-admin_live_panel{padding:12px}.quick-number{font-size:1.4rem}}
     </style>""", unsafe_allow_html=True)
@@ -304,6 +307,20 @@ def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
         return
+    tournament_names = [item["name"] for item in rows(db, "SELECT name FROM tournaments ORDER BY name")]
+    if "new_admin_tournament" in st.session_state:
+        st.session_state.admin_tournament = st.session_state.pop("new_admin_tournament")
+    tournament = st.selectbox("Tournament", tournament_names, key="admin_tournament")
+    with st.expander("Create tournament"):
+        with st.form("create_tournament_form"):
+            tournament_name = st.text_input("New tournament name", placeholder="SHL5")
+            if st.form_submit_button("Create tournament"):
+                try:
+                    st.session_state.new_admin_tournament = create_tournament(db, tournament_name)
+                    st.rerun()
+                except ValueError as error:
+                    st.error(str(error))
+    st.caption(f"Fixture management and poll preparation: {tournament}. Allocation review follows the active poll cycle. Live overview covers all tournaments.")
     render_admin_live_panel(db)
     # Streamlit tabs eagerly execute every panel on every widget interaction.
     # Conditional navigation keeps Supabase work limited to the visible page.
@@ -447,7 +464,7 @@ def render_admin(db):
         q_team2 = st.text_input("TEAM 2", key="quick_team2")
         q_add, q_open = st.columns(2)
         def quick_add(open_poll=False):
-            if add_fixture(db,q_date,q_time,q_team1,q_team2):
+            if add_fixture(db,q_date,q_time,q_team1,q_team2,tournament=tournament):
                 if open_poll:
                     fixture_id = rows(db, "SELECT id FROM fixtures WHERE home_team=:home AND away_team=:away ORDER BY id DESC LIMIT 1", {"home":q_team1.strip(),"away":q_team2.strip()})[0]["id"]
                     set_fixture_poll_state(db, fixture_id, "OPEN")
@@ -460,7 +477,7 @@ def render_admin(db):
             try: quick_add(True)
             except ValueError as error: st.error(str(error))
         st.markdown("#### Matches")
-        mobile_fixtures = rows(db,"SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
+        mobile_fixtures = rows(db,"SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id WHERE f.tournament=:tournament AND f.starts_at>=:today GROUP BY f.id ORDER BY f.starts_at LIMIT 12", {"tournament": tournament, "today": datetime.now(ZoneInfo(SGIA_TIMEZONE)).replace(hour=0,minute=0,second=0,microsecond=0,tzinfo=None)})
         for fixture in mobile_fixtures:
             with st.expander(f"{pd.Timestamp(fixture['starts_at']).strftime('%a %d %b · %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']}"):
                 st.markdown(f'<span class="match-badge status-{fixture["match_status"].lower()}">{fixture["match_status"]}</span> · {fixture["poll_state"]} · {fixture["responses"]} available', unsafe_allow_html=True)
@@ -498,7 +515,36 @@ def render_admin(db):
             st.download_button("DOWNLOAD CSV",pd.DataFrame(quick_board)[BOARD_COLUMNS].to_csv(index=False),"sgia-allocation.csv","text/csv",key="quick_csv")
             st.text_area("COPY WHATSAPP MESSAGE",allocation_message(db),height=220,key="quick_whatsapp")
     if admin_section == "Open Poll":
-        fixtures = rows(db, "SELECT f.*,COUNT(a.person_id) responses FROM fixtures f LEFT JOIN availability a ON a.fixture_id=f.id GROUP BY f.id ORDER BY f.starts_at")
+        st.subheader("Availability schedule")
+        st.caption("Prepare upcoming games here. Past dates are hidden automatically; match status is never changed automatically.")
+        today = datetime.now(ZoneInfo(SGIA_TIMEZONE)).date()
+        filter_cols = st.columns(3)
+        start_date = filter_cols[0].date_input("From date", today, key="poll_from")
+        end_date = filter_cols[1].date_input("To date", today + timedelta(days=14), key="poll_to")
+        status_filter = filter_cols[2].selectbox("Show", ["Ready to open / Open", "Frozen", "Published", "All states"], key="poll_status_filter")
+        if end_date < start_date:
+            st.warning("Choose a To date on or after From date.")
+            return
+        state_filter = {"Ready to open / Open": "AND f.poll_state IN ('OPEN','CLOSED') AND f.match_status='SCHEDULED'", "Frozen": "AND f.poll_state='FROZEN'", "Published": "AND f.poll_state='PUBLISHED'", "All states": ""}[status_filter]
+        params = {"start": datetime.combine(start_date, datetime.min.time()), "end": datetime.combine(end_date + timedelta(days=1), datetime.min.time())}
+        params["tournament"] = tournament
+        where = f"f.tournament=:tournament AND f.starts_at>=:start AND f.starts_at<:end {state_filter}"
+        count = rows(db, f"SELECT COUNT(*) n FROM fixtures f WHERE {where}", params)[0]["n"]
+        pages = max(1, (count + 11) // 12)
+        page = st.selectbox("Page", list(range(1, pages + 1)), key="poll_page")
+        params.update({"limit": 12, "offset": (page - 1) * 12})
+        fixtures = rows(db, f"SELECT f.* FROM fixtures f WHERE {where} ORDER BY f.starts_at LIMIT :limit OFFSET :offset", params)
+        st.caption(f"{count} matching games · showing at most 12 per page. Other open slots are preserved when you save.")
+        if not fixtures:
+            st.info("No games match these filters. Adjust the dates or status above.")
+        voter_map = {}
+        if fixtures:
+            ids = {f"id_{index}": fixture["id"] for index, fixture in enumerate(fixtures)}
+            placeholders = ",".join(f":{key}" for key in ids)
+            for voter in rows(db, f"SELECT a.fixture_id,p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id IN ({placeholders}) ORDER BY p.name", ids):
+                voter_map.setdefault(voter["fixture_id"], []).append(voter["name"])
+        for fixture in fixtures:
+            fixture["responses"] = len(voter_map.get(fixture["id"], []))
         state_counts = rows(db, "SELECT poll_state,COUNT(*) count FROM fixtures GROUP BY poll_state")
         st.caption(" · ".join(f"{item['poll_state']}: {item['count']}" for item in state_counts))
         freeze_col, publish_col = st.columns(2)
@@ -512,16 +558,27 @@ def render_admin(db):
             st.rerun()
         opened = []
         for fixture in fixtures:
-            locked = fixture["poll_state"] in ("FROZEN", "PUBLISHED")
+            locked = fixture["poll_state"] in ("FROZEN", "PUBLISHED") or fixture["match_status"] != "SCHEDULED"
             if st.checkbox(f"[{fixture['poll_state']}] {pd.Timestamp(fixture['starts_at']).strftime('%a %d %b, %I:%M %p')} — {fixture['home_team']} vs {fixture['away_team']} ({fixture['responses']} available)", value=fixture["poll_state"] == "OPEN", key=f"open_{fixture['id']}", disabled=locked):
                 opened.append(fixture["id"])
-            voters = rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:fixture ORDER BY p.name", {"fixture": fixture["id"]})
+            voters = voter_map.get(fixture["id"], [])
             if voters:
-                st.caption("Available: " + ", ".join(v["name"] for v in voters))
-        if st.button("Update open slots"):
-            update_open_slots(db, opened)
+                st.caption("Available: " + ", ".join(voters))
+        if st.button("Update open slots", disabled=not fixtures):
+            update_open_slots(db, opened, visible_fixture_ids=[fixture["id"] for fixture in fixtures])
             st.success("Open slots updated")
             st.rerun()
+        if fixtures:
+            with st.expander("Record match completion / cancellation"):
+                st.caption("To find older games, change From date above and choose All states. Completion updates Season Workload; only published games can be marked completed.")
+                status_fixture = st.selectbox("Match to update", fixtures, format_func=lambda item: f"{pd.Timestamp(item['starts_at']).strftime('%d %b %Y %I:%M %p')} · {item['home_team']} vs {item['away_team']} · {item['match_status']}", key="poll_match_to_update")
+                new_match_status = st.selectbox("Match status", ["COMPLETED", "CANCELLED", "SCHEDULED"], key="poll_match_status")
+                if st.button("Save match status", key="poll_save_match_status"):
+                    try:
+                        set_match_status(db, status_fixture["id"], new_match_status)
+                        st.rerun()
+                    except ValueError as error:
+                        st.warning(str(error))
     if admin_section == "Fixtures":
         st.subheader("Fixture Manager")
         fixture_section = st.radio(
@@ -538,14 +595,14 @@ def render_admin(db):
             add_team_2 = st.text_input("TEAM 2", key="fixture_add_team_2")
             if st.button("Add Fixture"):
                 try:
-                    if add_fixture(db, add_date, add_time, add_team_1, add_team_2):
+                    if add_fixture(db, add_date, add_time, add_team_1, add_team_2, tournament=tournament):
                         st.success("Fixture added.")
                     else:
                         st.warning("Duplicate fixture was not added.")
                 except ValueError as error:
                     st.error(str(error))
         if fixture_section == "Edit Fixture":
-            fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures ORDER BY starts_at")
+            fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures WHERE tournament=:tournament ORDER BY starts_at", {"tournament": tournament})
             fixture_labels = {f"{pd.Timestamp(item['starts_at']).strftime('%d-%b-%Y %I:%M %p')} · {item['home_team']} vs {item['away_team']}": item for item in fixture_options}
             selected_label = st.selectbox("Fixture", list(fixture_labels), key="fixture_edit_select")
             if selected_label:
@@ -583,14 +640,14 @@ def render_admin(db):
             current_csv_col, current_xlsx_col = st.columns(2)
             current_csv_col.download_button(
                 "DOWNLOAD CURRENT FIXTURES CSV",
-                current_fixtures_csv(db),
+                current_fixtures_csv(db, tournament),
                 "sgia-current-fixtures.csv",
                 "text/csv",
                 use_container_width=True,
             )
             current_xlsx_col.download_button(
                 "DOWNLOAD CURRENT FIXTURES EXCEL",
-                current_fixtures_xlsx(db),
+                current_fixtures_xlsx(db, tournament),
                 "sgia-current-fixtures.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
@@ -603,7 +660,7 @@ def render_admin(db):
             if uploaded_fixture_file and st.button("PREVIEW UPLOADED FILE", type="primary", use_container_width=True):
                 try:
                     st.session_state.fixture_preview = preview_fixture_file(
-                        db, uploaded_fixture_file.name, uploaded_fixture_file.getvalue()
+                        db, uploaded_fixture_file.name, uploaded_fixture_file.getvalue(), tournament=tournament
                     )
                 except Exception as error:
                     st.session_state.fixture_preview = [{
@@ -618,9 +675,10 @@ def render_admin(db):
                 height=180,
             )
             if st.button("PREVIEW PASTED FIXTURES", use_container_width=True):
-                st.session_state.fixture_preview = preview_bulk_fixtures(db, bulk_text)
+                st.session_state.fixture_preview = preview_bulk_fixtures(db, bulk_text, tournament=tournament)
             fixture_preview = st.session_state.get("fixture_preview", [])
             if fixture_preview:
+                st.caption("Preview tournament: " + fixture_preview[0].get("tournament", tournament))
                 preview_frame = pd.DataFrame(fixture_preview)
                 for column in PREVIEW_COLUMNS:
                     if column not in preview_frame:

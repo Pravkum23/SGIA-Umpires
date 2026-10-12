@@ -105,16 +105,16 @@ def _display_datetime(starts_at):
     }
 
 
-def add_fixture(engine, date_value, time_value, team_1, team_2):
+def add_fixture(engine, date_value, time_value, team_1, team_2, tournament="SHL4"):
     starts_at = _parse_datetime(date_value, time_value)
     team_1, team_2 = _clean_text(team_1), _clean_text(team_2)
     if not team_1 or not team_2:
         raise ValueError("Both teams are required")
     with engine.begin() as connection:
         result = connection.execute(text("""
-            INSERT INTO fixtures(starts_at,home_team,away_team,availability_open,poll_state)
-            VALUES(:starts,:home,:away,false,'CLOSED') ON CONFLICT(starts_at) DO NOTHING
-        """), {"starts": starts_at, "home": team_1, "away": team_2})
+            INSERT INTO fixtures(starts_at,home_team,away_team,availability_open,poll_state,tournament)
+            VALUES(:starts,:home,:away,false,'CLOSED',:tournament) ON CONFLICT(starts_at) DO NOTHING
+        """), {"starts": starts_at, "home": team_1, "away": team_2, "tournament": tournament})
         return result.rowcount == 1
 
 
@@ -221,12 +221,12 @@ def _preview_rows(engine, raw_rows):
     return preview
 
 
-def preview_bulk_fixtures(engine, pasted_text):
+def preview_bulk_fixtures(engine, pasted_text, tournament="SHL4"):
     """Preview pipe, tab, or CSV text using the shared safe import path."""
-    return _preview_rows(engine, _raw_rows_from_text(pasted_text or ""))
+    return [{**row, "tournament": tournament} for row in _preview_rows(engine, _raw_rows_from_text(pasted_text or ""))]
 
 
-def preview_fixture_file(engine, filename, content):
+def preview_fixture_file(engine, filename, content, tournament="SHL4"):
     suffix = str(filename or "").lower().rsplit(".", 1)[-1]
     if suffix == "csv":
         text_value = content.decode("utf-8-sig") if isinstance(content, bytes) else str(content)
@@ -236,7 +236,7 @@ def preview_fixture_file(engine, filename, content):
         raw_rows = _raw_rows_from_values(workbook.active.iter_rows(values_only=True))
     else:
         raw_rows = [{"Line": 1, "_source_error": "Only .csv and .xlsx files are supported"}]
-    return _preview_rows(engine, raw_rows)
+    return [{**row, "tournament": tournament} for row in _preview_rows(engine, raw_rows)]
 
 
 def import_bulk_fixtures(engine, preview):
@@ -246,9 +246,9 @@ def import_bulk_fixtures(engine, preview):
             if item.get("Status") != "READY":
                 continue
             result = connection.execute(text("""
-                INSERT INTO fixtures(starts_at,home_team,away_team,availability_open,poll_state)
-                VALUES(:starts,:home,:away,false,'CLOSED') ON CONFLICT(starts_at) DO NOTHING
-            """), {"starts": item["starts_at"], "home": item["TEAM 1"], "away": item["TEAM 2"]})
+                INSERT INTO fixtures(starts_at,home_team,away_team,availability_open,poll_state,tournament)
+                VALUES(:starts,:home,:away,false,'CLOSED',:tournament) ON CONFLICT(starts_at) DO NOTHING
+            """), {"starts": item["starts_at"], "home": item["TEAM 1"], "away": item["TEAM 2"], "tournament": item.get("tournament", "SHL4")})
             imported += max(result.rowcount, 0)
     return imported
 
@@ -309,12 +309,13 @@ def fixture_template_xlsx():
     return output.getvalue()
 
 
-def current_fixture_records(engine):
+def current_fixture_records(engine, tournament=None):
+    tournament_filter = "WHERE tournament=:tournament" if tournament is not None else ""
     with engine.connect() as connection:
-        fixtures = list(connection.execute(text("""
+        fixtures = list(connection.execute(text(f"""
             SELECT starts_at,home_team,away_team,poll_state,match_status
-            FROM fixtures ORDER BY starts_at
-        """)).mappings())
+            FROM fixtures {tournament_filter} ORDER BY starts_at
+        """), {"tournament": tournament}).mappings())
     records = []
     for fixture in fixtures:
         display = _display_datetime(fixture.starts_at)
@@ -328,13 +329,13 @@ def current_fixture_records(engine):
     return records
 
 
-def current_fixtures_csv(engine):
+def current_fixtures_csv(engine, tournament=None):
     output = StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=CURRENT_FIXTURE_COLUMNS, lineterminator="\n")
     writer.writeheader()
-    writer.writerows(current_fixture_records(engine))
+    writer.writerows(current_fixture_records(engine, tournament))
     return output.getvalue().encode("utf-8-sig")
 
 
-def current_fixtures_xlsx(engine):
-    return _styled_workbook(CURRENT_FIXTURE_COLUMNS, current_fixture_records(engine))
+def current_fixtures_xlsx(engine, tournament=None):
+    return _styled_workbook(CURRENT_FIXTURE_COLUMNS, current_fixture_records(engine, tournament))

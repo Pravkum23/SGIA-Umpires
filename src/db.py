@@ -67,6 +67,11 @@ def initialize(engine):
         for statement in schema_for(engine.dialect.name).split(";"):
             if statement.strip(): c.execute(text(statement))
         fixture_columns = {column["name"] for column in inspect(c).get_columns("fixtures")}
+        c.execute(text("CREATE TABLE IF NOT EXISTS tournaments (name VARCHAR(80) PRIMARY KEY)"))
+        c.execute(text("INSERT INTO tournaments(name) VALUES('SHL4') ON CONFLICT(name) DO NOTHING"))
+        if "tournament" not in fixture_columns:
+            c.execute(text("ALTER TABLE fixtures ADD COLUMN tournament VARCHAR(80) NOT NULL DEFAULT 'SHL4' REFERENCES tournaments(name)"))
+        c.execute(text("CREATE INDEX IF NOT EXISTS fixtures_tournament_date ON fixtures(tournament,starts_at)"))
         if "poll_state" not in fixture_columns:
             c.execute(text("ALTER TABLE fixtures ADD COLUMN poll_state VARCHAR(12) NOT NULL DEFAULT 'CLOSED'"))
         if "match_status" not in fixture_columns:

@@ -135,7 +135,7 @@ def ensure_allocation_cycle(connection):
     }).mappings().first()
 
 
-def update_open_slots(engine, fixture_ids):
+def update_open_slots(engine, fixture_ids, visible_fixture_ids=None):
     """Replace the OPEN fixture set without changing the cycle identity."""
     desired_input = {int(value) for value in fixture_ids}
     with engine.begin() as connection:
@@ -144,6 +144,9 @@ def update_open_slots(engine, fixture_ids):
         ))}
         desired = desired_input & valid
         before = {row.id for row in connection.execute(text("SELECT id FROM fixtures WHERE poll_state='OPEN'"))}
+        if visible_fixture_ids is not None:
+            visible = {int(value) for value in visible_fixture_ids}
+            desired = (desired & visible) | (before - visible)
         cycle = current_cycle(connection, ("OPEN",))
         created = False
         if not cycle and desired:
