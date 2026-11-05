@@ -105,13 +105,14 @@ def availability_for_person(engine, person_id, state="OPEN"):
 
 
 def published_duties(engine, person_id):
+    from .weekly import singapore_now
     with engine.connect() as connection:
         return [dict(row) for row in connection.execute(text("""
             SELECT a.fixture_id,a.role,a.status,f.starts_at,f.home_team,f.away_team
             FROM assignments a JOIN fixtures f ON f.id=a.fixture_id
-            WHERE a.person_id=:person AND a.confirmed=true AND f.poll_state='PUBLISHED'
+            WHERE a.person_id=:person AND a.confirmed=true AND f.poll_state='PUBLISHED' AND f.match_status='SCHEDULED' AND f.starts_at>:now
             ORDER BY f.starts_at,a.role
-        """), {"person": person_id}).mappings()]
+        """), {"person": person_id, "now": singapore_now()}).mappings()]
 
 
 def withdraw_assignment(engine, fixture_id, role, person_id):
