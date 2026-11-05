@@ -32,6 +32,7 @@ from src.lifecycle import assignment_history, authenticate_person, confirm_assig
 from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
+from src.weekly import WEEK_FILTER, close_week, enable_week, singapore_now, week_bounds
 from src.workload import fixture_history, season_workload, set_match_status
 from src.tournaments import create_tournament
 
@@ -183,13 +184,13 @@ def render_public(db):
     open_slots = rows(db, """
         SELECT f.*,COUNT(a.person_id) votes FROM fixtures f
         LEFT JOIN availability a ON a.fixture_id=f.id
-        WHERE f.poll_state='OPEN' GROUP BY f.id ORDER BY f.starts_at
-    """)
+        WHERE f.poll_state='OPEN' AND f.match_status='SCHEDULED' AND f.starts_at>:now GROUP BY f.id ORDER BY f.starts_at
+    """, {"now": singapore_now()})
     frozen_slots = rows(db, """
         SELECT f.*,COUNT(a.person_id) votes FROM fixtures f
         LEFT JOIN availability a ON a.fixture_id=f.id
-        WHERE f.poll_state='FROZEN' GROUP BY f.id ORDER BY f.starts_at
-    """)
+        WHERE f.poll_state='FROZEN' AND f.match_status='SCHEDULED' AND f.starts_at>:now GROUP BY f.id ORDER BY f.starts_at
+    """, {"now": singapore_now()})
     slots = open_slots or frozen_slots
     poll_state = "OPEN" if open_slots else ("FROZEN" if frozen_slots else None)
     try:
@@ -303,6 +304,63 @@ def render_admin_live_panel(db):
                     st.caption("Awaiting response: " + ", ".join(live["yet_to_respond"]))
 
 
+def render_week(db, tournament):
+    now = singapore_now()
+    day = st.date_input("Week containing", now.date(), key="weekly_date")
+    start, end = week_bounds(day)
+    st.subheader(f"{start:%d %b} – {end - timedelta(days=1):%d %b %Y}")
+    fixtures = rows(db, f"""
+        SELECT id,starts_at,home_team,away_team,poll_state FROM fixtures
+        WHERE {WEEK_FILTER} ORDER BY starts_at
+    """, {"tournament": tournament, "start": start, "end": end})
+    upcoming = [f for f in fixtures if pd.Timestamp(f["starts_at"]) > now]
+    enabled = [f for f in fixtures if f["poll_state"] in ("OPEN", "FROZEN")]
+    if not upcoming:
+        st.caption("No upcoming matches this week. Choose another week or add a fixture.")
+    for match in upcoming:
+        label = {"OPEN": "Collecting availability", "FROZEN": "Ready to allocate",
+                 "PUBLISHED": "Allocation published"}.get(match["poll_state"], "Ready to enable")
+        st.write(f"**{pd.Timestamp(match['starts_at']):%a %d %b · %I:%M %p}** · {match['home_team']} vs {match['away_team']} · {label}")
+    if st.button("Enable this week’s matches", type="primary",
+                 disabled=not any(f["poll_state"] == "CLOSED" for f in upcoming)):
+        enable_week(db, tournament, start, end)
+        st.rerun()
+    if not enabled:
+        return
+    st.subheader("Allocate officials")
+    if st.button("Suggest officials from availability"):
+        propose(db, week=(tournament, start, end))
+        st.rerun()
+    people = rows(db, "SELECT name,can_umpire,can_score FROM people WHERE active=true ORDER BY name")
+    for match in enabled:
+        fid = match["id"]
+        with st.expander(f"{pd.Timestamp(match['starts_at']):%a %d %b · %I:%M %p} · {match['home_team']} vs {match['away_team']}"):
+            available = {r["name"] for r in rows(db, "SELECT p.name FROM availability a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:id", {"id": fid})}
+            st.caption("Available: " + (", ".join(sorted(available)) or "No responses yet"))
+            assigned = {r["role"]: r["name"] for r in rows(db, "SELECT a.role,p.name FROM assignments a JOIN people p ON p.id=a.person_id WHERE a.fixture_id=:id", {"id": fid})}
+            record = {"fixture_id": fid}
+            with st.form(f"week_assign_{fid}"):
+                for role, label in (("umpire_1", "Umpire 1"), ("umpire_2", "Umpire 2"), ("scorer", "Scorer")):
+                    capability = "can_score" if role == "scorer" else "can_umpire"
+                    names = [""] + sorted([p["name"] for p in people if p[capability]], key=lambda n: (n not in available, n))
+                    current = assigned.get(role)
+                    record[label] = st.selectbox(label, names, index=names.index(current) if current in names else 0,
+                        format_func=lambda n: (n + (" · available" if n in available else "")) if n else "Choose official")
+                if st.form_submit_button("Save allocation"):
+                    choices = [record[key] for key in ("Umpire 1", "Umpire 2", "Scorer")]
+                    if all(choices) and len(set(choices)) == 3:
+                        save_allocation_board(db, [record])
+                        st.success("Allocation saved.")
+                    else:
+                        st.warning("Choose three different officials.")
+    if st.button("Close week and publish duties"):
+        try:
+            close_week(db, tournament, start, end)
+            st.rerun()
+        except ValueError as error:
+            st.warning(str(error))
+
+
 def render_admin(db):
     brand(admin=True)
     if not admin_authenticated():
@@ -320,11 +378,9 @@ def render_admin(db):
                     st.rerun()
                 except ValueError as error:
                     st.error(str(error))
-    st.caption(f"Fixture management and poll preparation: {tournament}. Allocation review follows the active poll cycle. Live overview covers all tournaments.")
-    render_admin_live_panel(db)
     # Streamlit tabs eagerly execute every panel on every widget interaction.
     # Conditional navigation keeps Supabase work limited to the visible page.
-    admin_sections = ["Quick Admin", "Open Poll", "Fixtures", "Allocations", "Allocation Board", "People", "Season Workload", "History", "Output"]
+    admin_sections = ["Weekly matches", "Fixtures", "More tools"]
     admin_section = st.radio(
         "Admin section",
         admin_sections,
@@ -332,6 +388,12 @@ def render_admin(db):
         label_visibility="collapsed",
         key="admin_navigation",
     )
+    if admin_section == "Weekly matches":
+        render_week(db, tournament)
+        return
+    if admin_section == "More tools":
+        admin_section = st.selectbox("Tool", ["Allocations", "Allocation Board", "People", "Season Workload", "History", "Output", "Quick Admin", "Open Poll"])
+        render_admin_live_panel(db)
     if admin_section == "Quick Admin":
         st.subheader("Quick Admin")
         live = live_poll_monitor(db)
@@ -602,7 +664,7 @@ def render_admin(db):
                 except ValueError as error:
                     st.error(str(error))
         if fixture_section == "Edit Fixture":
-            fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures WHERE tournament=:tournament ORDER BY starts_at", {"tournament": tournament})
+            fixture_options = rows(db, "SELECT id,starts_at,home_team,away_team FROM fixtures WHERE tournament=:tournament AND starts_at>:now ORDER BY starts_at", {"tournament": tournament, "now": singapore_now()})
             fixture_labels = {f"{pd.Timestamp(item['starts_at']).strftime('%d-%b-%Y %I:%M %p')} · {item['home_team']} vs {item['away_team']}": item for item in fixture_options}
             selected_label = st.selectbox("Fixture", list(fixture_labels), key="fixture_edit_select")
             if selected_label:
