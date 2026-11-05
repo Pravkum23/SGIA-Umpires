@@ -143,15 +143,17 @@ def rows(engine, sql, params=None):
 
 def save_vote(engine, person_id, fixture_ids, device="Unknown", browser="Other"):
     """Replace only this person's votes in the poll that is currently open."""
+    from .weekly import singapore_now
+    now = singapore_now()
     with engine.begin() as c:
-        open_ids = {row.id for row in c.execute(text("SELECT id FROM fixtures WHERE poll_state='OPEN'"))}
-        previous = {row.fixture_id for row in c.execute(text("SELECT fixture_id FROM availability WHERE person_id=:p AND fixture_id IN (SELECT id FROM fixtures WHERE poll_state='OPEN')"), {"p": person_id})}
+        open_ids = {row.id for row in c.execute(text("SELECT id FROM fixtures WHERE poll_state='OPEN' AND match_status='SCHEDULED' AND starts_at>:now"), {"now": now})}
+        previous = {row.fixture_id for row in c.execute(text("SELECT fixture_id FROM availability WHERE person_id=:p AND fixture_id IN (SELECT id FROM fixtures WHERE poll_state='OPEN' AND match_status='SCHEDULED' AND starts_at>:now)"), {"p": person_id, "now": now})}
         selected = {int(fixture_id) for fixture_id in fixture_ids} & open_ids
         c.execute(text("""
             DELETE FROM availability
             WHERE person_id=:p
-              AND fixture_id IN (SELECT id FROM fixtures WHERE poll_state='OPEN')
-        """), {"p":person_id})
+              AND fixture_id IN (SELECT id FROM fixtures WHERE poll_state='OPEN' AND match_status='SCHEDULED' AND starts_at>:now)
+        """), {"p":person_id, "now":now})
         for fixture_id in selected:
             c.execute(text("INSERT INTO availability(person_id,fixture_id) VALUES(:p,:f) ON CONFLICT(person_id,fixture_id) DO NOTHING"), {"p":person_id,"f":fixture_id})
         for fixture_id in selected - previous:
