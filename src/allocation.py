@@ -10,26 +10,34 @@ def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
 
 
-def propose(engine, regenerate_unconfirmed=False):
+def propose(engine, regenerate_unconfirmed=False, *, week=None):
     """Create proposals from saved votes; poll open/closed state is intentionally irrelevant."""
     with engine.begin() as c:
-        ensure_allocation_cycle(c)
-        cycle = current_allocation_cycle(c)
-        if not cycle:
-            return 0
+        if week is None:
+            ensure_allocation_cycle(c)
+            cycle = current_allocation_cycle(c)
+            if not cycle:
+                return 0
+            scope = "poll_cycle_id=:cycle"
+            params = {"cycle": cycle.id}
+        else:
+            tournament, start, end = week
+            scope = """tournament=:tournament AND starts_at>=:start AND starts_at<:end
+                       AND match_status='SCHEDULED' AND poll_state IN ('OPEN','FROZEN')"""
+            params = {"tournament": tournament, "start": start, "end": end}
         if regenerate_unconfirmed:
-            c.execute(text("""
+            c.execute(text(f"""
                 DELETE FROM assignments WHERE confirmed=false AND fixture_id IN (
-                    SELECT id FROM fixtures WHERE poll_cycle_id=:cycle
+                    SELECT id FROM fixtures WHERE {scope}
                 )
-            """), {"cycle": cycle.id})
+            """), params)
 
-        fixtures = list(c.execute(text("""
+        fixtures = list(c.execute(text(f"""
             SELECT f.* FROM fixtures f
-            WHERE f.poll_cycle_id=:cycle AND f.poll_state IN ('OPEN','FROZEN')
+            WHERE {scope} AND f.poll_state IN ('OPEN','FROZEN')
               AND EXISTS (SELECT 1 FROM availability a WHERE a.fixture_id=f.id)
             ORDER BY f.starts_at
-        """), {"cycle": cycle.id}).mappings())
+        """), params).mappings())
         existing = {(r.fixture_id, r.role): r for r in c.execute(text("SELECT * FROM assignments")).mappings()}
         season = {
             row.person_id: (int(row.games_completed), int(row.total_assigned))
