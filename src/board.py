@@ -17,12 +17,13 @@ def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
 
 
-def allocation_board(engine, confirmed_only=False, cycle_id=None):
+def allocation_board(engine, confirmed_only=False, cycle_id=None, tournament=None, published_only=False):
+    active_only = cycle_id is None
     assignment_filter = " AND a.confirmed=true AND a.status='ASSIGNED'" if confirmed_only else ""
     exists_filter = " AND x.confirmed=true AND x.status='ASSIGNED'" if confirmed_only else ""
     with engine.connect() as connection:
         if cycle_id is None:
-            cycle = current_allocation_cycle(connection)
+            cycle = current_allocation_cycle(connection, tournament)
             if not cycle:
                 return []
             cycle_id = cycle.id
@@ -32,9 +33,12 @@ def allocation_board(engine, confirmed_only=False, cycle_id=None):
             LEFT JOIN assignments a ON a.fixture_id=f.id{assignment_filter}
             LEFT JOIN people p ON p.id=a.person_id
             WHERE f.poll_cycle_id=:cycle AND f.poll_state<>'CLOSED'
+              AND (:tournament IS NULL OR f.tournament=:tournament)
+              AND (:active_only=false OR f.poll_state IN ('OPEN','FROZEN'))
+              AND (:published_only=false OR f.poll_state='PUBLISHED')
               AND EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id{exists_filter})
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id}).mappings())
+        """), {"cycle": cycle_id, "tournament": tournament, "active_only": active_only, "published_only": published_only}).mappings())
     board = {}
     for row in data:
         starts = _dt(row.starts_at)
@@ -54,11 +58,11 @@ def allocation_board(engine, confirmed_only=False, cycle_id=None):
     return list(board.values())
 
 
-def allocation_review(engine, cycle_id=None):
+def allocation_review(engine, cycle_id=None, tournament=None):
     """Return one editable review row per fixture with all three roles together."""
     with engine.connect() as connection:
         if cycle_id is None:
-            cycle = current_allocation_cycle(connection)
+            cycle = current_allocation_cycle(connection, tournament)
             if not cycle:
                 return []
             cycle_id = cycle.id
@@ -67,9 +71,10 @@ def allocation_review(engine, cycle_id=None):
                    a.confirmed,a.reason,a.status assignment_status
             FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
             JOIN people p ON p.id=a.person_id
-            WHERE f.poll_cycle_id=:cycle AND f.poll_state<>'CLOSED'
+            WHERE f.poll_cycle_id=:cycle AND f.poll_state IN ('OPEN','FROZEN')
+              AND (:tournament IS NULL OR f.tournament=:tournament)
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id}).mappings())
+        """), {"cycle": cycle_id, "tournament": tournament}).mappings())
     review = {}
     for row in data:
         starts = _dt(row.starts_at)
@@ -104,10 +109,10 @@ def allocation_review(engine, cycle_id=None):
     return result
 
 
-def confirmed_allocation_board(engine, cycle_id=None):
+def confirmed_allocation_board(engine, cycle_id=None, tournament=None):
     """Return only complete fixtures whose three current assignments are confirmed and active."""
     return [
-        record for record in allocation_board(engine, confirmed_only=True, cycle_id=cycle_id)
+        record for record in allocation_board(engine, confirmed_only=True, cycle_id=cycle_id, tournament=tournament)
         if all(record[column] for column in ("Umpire 1", "Umpire 2", "Scorer"))
     ]
 
@@ -165,9 +170,9 @@ def save_allocation_review(engine, records, confirm=False):
                     """), {"fixture": fixture_id, "role": role, "person": person.id})
 
 
-def confirm_all_proposed(engine):
+def confirm_all_proposed(engine, tournament=None):
     """Confirm every complete, active proposal and preserve a per-role audit event."""
-    review = [row for row in allocation_review(engine) if row["Status"] == "Proposed"]
+    review = [row for row in allocation_review(engine, tournament=tournament) if row["Status"] == "Proposed"]
     if review:
         save_allocation_review(engine, review, confirm=True)
     return len(review)
