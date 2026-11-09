@@ -36,21 +36,21 @@ def coverage_status(people):
     return "DISTINCT ROLE COVERAGE NEEDED"
 
 
-def live_poll_monitor(engine):
+def live_poll_monitor(engine, tournament=None):
     """Return the current OPEN-poll operational summary for admin only."""
     with engine.connect() as connection:
         fixtures = [dict(row) for row in connection.execute(text("""
             SELECT id,starts_at,home_team,away_team FROM fixtures
-            WHERE poll_state='OPEN' ORDER BY starts_at,id
-        """)).mappings()]
+            WHERE poll_state='OPEN' AND (:tournament IS NULL OR tournament=:tournament) ORDER BY starts_at,id
+        """), {"tournament": tournament}).mappings()]
         active = [dict(row) for row in connection.execute(text(
             "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY name"
         )).mappings()]
         availability = [dict(row) for row in connection.execute(text("""
             SELECT a.fixture_id,p.id,p.name,p.can_umpire,p.can_score
             FROM availability a JOIN people p ON p.id=a.person_id JOIN fixtures f ON f.id=a.fixture_id
-            WHERE f.poll_state='OPEN' AND p.active=true ORDER BY p.name
-        """)).mappings()]
+            WHERE (:tournament IS NULL OR f.tournament=:tournament) AND f.poll_state='OPEN' AND p.active=true ORDER BY p.name
+        """), {"tournament": tournament}).mappings()]
 
     by_fixture = defaultdict(list)
     for person in availability:
@@ -78,7 +78,7 @@ def live_poll_monitor(engine):
     for day in by_day.values():
         day["unique_available"] = len(day.pop("available_ids"))
         days.append(day)
-    audit = response_audit(engine)
+    audit = response_audit(engine, tournament=tournament)
     audited_people = audit["people"] if audit["cycle"] and audit["cycle"]["status"] == "OPEN" else []
     responded = [person for person in audited_people if person["Submission Count"] > 0]
     not_responded = [person for person in audited_people if person["Submission Count"] == 0]
