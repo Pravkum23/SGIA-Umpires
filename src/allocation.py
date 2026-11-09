@@ -10,25 +10,28 @@ def _dt(value):
     return value if hasattr(value, "date") else datetime.fromisoformat(value)
 
 
-def propose(engine, regenerate_unconfirmed=False, *, week=None):
+def propose(engine, regenerate_unconfirmed=False, *, week=None, tournament=None, fixture_ids=None):
     """Create proposals from saved votes; poll open/closed state is intentionally irrelevant."""
     with engine.begin() as c:
         if week is None:
             ensure_allocation_cycle(c)
-            cycle = current_allocation_cycle(c)
+            cycle = current_allocation_cycle(c, tournament)
             if not cycle:
                 return 0
-            scope = "poll_cycle_id=:cycle"
-            params = {"cycle": cycle.id}
+            scope = "poll_cycle_id=:cycle AND (:tournament IS NULL OR tournament=:tournament)"
+            params = {"cycle": cycle.id, "tournament": tournament}
         else:
             tournament, start, end = week
             scope = """tournament=:tournament AND starts_at>=:start AND starts_at<:end
                        AND match_status='SCHEDULED' AND poll_state IN ('OPEN','FROZEN')"""
             params = {"tournament": tournament, "start": start, "end": end}
+        if fixture_ids is not None:
+            from .weekly import selected_filter
+            scope += selected_filter(fixture_ids, params)
         if regenerate_unconfirmed:
             c.execute(text(f"""
                 DELETE FROM assignments WHERE confirmed=false AND fixture_id IN (
-                    SELECT id FROM fixtures WHERE {scope}
+                    SELECT id FROM fixtures WHERE {scope} AND poll_state IN ('OPEN','FROZEN')
                 )
             """), params)
 
@@ -116,20 +119,20 @@ def propose(engine, regenerate_unconfirmed=False, *, week=None):
                 schedule[chosen.id].append((starts, role))
 
 
-def allocation_message(engine, cycle_id=None):
+def allocation_message(engine, cycle_id=None, tournament=None):
     with engine.connect() as c:
         if cycle_id is None:
-            cycle = current_allocation_cycle(c)
+            cycle = current_allocation_cycle(c, tournament)
             if not cycle:
                 return "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
             cycle_id = cycle.id
         data = list(c.execute(text("""
             SELECT f.starts_at,f.home_team,f.away_team,a.role,p.name
             FROM assignments a JOIN fixtures f ON f.id=a.fixture_id JOIN people p ON p.id=a.person_id
-            WHERE a.confirmed=true AND a.status='ASSIGNED' AND f.poll_cycle_id=:cycle
+            WHERE (:tournament IS NULL OR f.tournament=:tournament) AND a.confirmed=true AND a.status='ASSIGNED' AND f.poll_cycle_id=:cycle
               AND f.poll_state<>'CLOSED'
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id}).mappings())
+        """), {"cycle": cycle_id, "tournament": tournament}).mappings())
     grouped = {}
     for row in data:
         dt = _dt(row.starts_at)

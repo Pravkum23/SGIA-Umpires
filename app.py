@@ -32,7 +32,7 @@ from src.lifecycle import assignment_history, authenticate_person, confirm_assig
 from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
-from src.weekly import WEEK_FILTER, close_week, enable_week, singapore_now, week_bounds
+from src.weekly import WEEK_FILTER, close_week, enable_week, reopen_selected, singapore_now, week_bounds
 from src.workload import fixture_history, season_workload, set_match_status
 from src.tournaments import create_tournament
 
@@ -264,15 +264,15 @@ def admin_authenticated():
 
 
 @st.fragment(run_every="15s")
-def render_admin_live_panel(db):
+def render_admin_live_panel(db, tournament):
     """Refresh only read-only operational data; never rerun an active editor."""
     with st.container(key="admin_live_panel"):
         title_col, refresh_col = st.columns([3, 1])
         title_col.markdown("### Operations overview")
         refresh_col.button("Refresh status", key="admin_refresh_status", use_container_width=True)
         try:
-            live = live_poll_monitor(db)
-            replacements = rows(db, "SELECT COUNT(*) n FROM assignments WHERE status='REPLACEMENT_REQUIRED'")[0]["n"]
+            live = live_poll_monitor(db, tournament=tournament)
+            replacements = rows(db, "SELECT COUNT(*) n FROM assignments a JOIN fixtures f ON f.id=a.fixture_id WHERE f.tournament=:tournament AND a.status='REPLACEMENT_REQUIRED'", {"tournament": tournament})[0]["n"]
         except Exception:
             st.warning("Live status is temporarily unavailable. Your editing screens remain available; retry Refresh status.")
             return
@@ -314,22 +314,40 @@ def render_week(db, tournament):
         WHERE {WEEK_FILTER} ORDER BY starts_at
     """, {"tournament": tournament, "start": start, "end": end})
     upcoming = [f for f in fixtures if pd.Timestamp(f["starts_at"]) > now]
-    enabled = [f for f in fixtures if f["poll_state"] in ("OPEN", "FROZEN")]
     if not upcoming:
         st.caption("No upcoming matches this week. Choose another week or add a fixture.")
     for match in upcoming:
         label = {"OPEN": "Collecting availability", "FROZEN": "Ready to allocate",
                  "PUBLISHED": "Allocation published"}.get(match["poll_state"], "Ready to enable")
         st.write(f"**{pd.Timestamp(match['starts_at']):%a %d %b · %I:%M %p}** · {match['home_team']} vs {match['away_team']} · {label}")
-    if st.button("Enable this week’s matches", type="primary",
-                 disabled=not any(f["poll_state"] == "CLOSED" for f in upcoming)):
-        enable_week(db, tournament, start, end)
+    selection_key = f"weekly_selection_{tournament}_{start:%Y%m%d}"
+    preset = st.radio("Choose matches", ["Entire week", "Tuesday–Friday", "Saturday–Sunday", "Pick matches"], horizontal=True, key=selection_key)
+    candidates = upcoming
+    if preset == "Tuesday–Friday":
+        candidates = [f for f in upcoming if pd.Timestamp(f["starts_at"]).weekday() in (1, 2, 3, 4)]
+    elif preset == "Saturday–Sunday":
+        candidates = [f for f in upcoming if pd.Timestamp(f["starts_at"]).weekday() in (5, 6)]
+    lookup = {f["id"]: f for f in upcoming}
+    selected_ids = st.multiselect("Selected matches", list(lookup),
+        default=[f["id"] for f in candidates] if preset != "Pick matches" else [],
+        format_func=lambda fid: f"{pd.Timestamp(lookup[fid]['starts_at']):%a %d %b · %I:%M %p} · {lookup[fid]['home_team']} vs {lookup[fid]['away_team']}",
+        key=f"{selection_key}_{preset}")
+    selected_matches = [lookup[fid] for fid in selected_ids]
+    if st.button("Enable selected matches", type="primary",
+                 disabled=not any(f["poll_state"] == "CLOSED" for f in selected_matches)):
+        enable_week(db, tournament, start, end, selected_ids)
         st.rerun()
+    if st.button("Unpublish selected matches",
+                 disabled=not any(f["poll_state"] == "PUBLISHED" for f in selected_matches)):
+        reopen_selected(db, tournament, start, end, selected_ids)
+        st.rerun()
+    st.caption("Unpublish removes selected duties from the umpire app. Saved allocations and availability remain available for editing and publishing later.")
+    enabled = [f for f in selected_matches if f["poll_state"] in ("OPEN", "FROZEN")]
     if not enabled:
         return
     st.subheader("Allocate officials")
     if st.button("Suggest officials from availability"):
-        propose(db, week=(tournament, start, end))
+        propose(db, week=(tournament, start, end), fixture_ids=selected_ids)
         st.rerun()
     people = rows(db, "SELECT name,can_umpire,can_score FROM people WHERE active=true ORDER BY name")
     for match in enabled:
@@ -353,9 +371,9 @@ def render_week(db, tournament):
                         st.success("Allocation saved.")
                     else:
                         st.warning("Choose three different officials.")
-    if st.button("Close week and publish duties"):
+    if st.button("Publish selected matches and close availability"):
         try:
-            close_week(db, tournament, start, end)
+            close_week(db, tournament, start, end, selected_ids)
             st.rerun()
         except ValueError as error:
             st.warning(str(error))
@@ -369,6 +387,11 @@ def render_admin(db):
     if "new_admin_tournament" in st.session_state:
         st.session_state.admin_tournament = st.session_state.pop("new_admin_tournament")
     tournament = st.selectbox("Tournament", tournament_names, key="admin_tournament")
+    if st.session_state.get("_previous_tournament") != tournament:
+        for key in list(st.session_state):
+            if key.startswith(("allocation_", "review_", "published_", "quick_", "mobile_", "open_", "poll_", "weekly_selection")):
+                del st.session_state[key]
+        st.session_state["_previous_tournament"] = tournament
     with st.expander("Create tournament"):
         with st.form("create_tournament_form"):
             tournament_name = st.text_input("New tournament name", placeholder="SHL5")
@@ -393,10 +416,10 @@ def render_admin(db):
         return
     if admin_section == "More tools":
         admin_section = st.selectbox("Tool", ["Allocations", "Allocation Board", "People", "Season Workload", "History", "Output", "Quick Admin", "Open Poll"])
-        render_admin_live_panel(db)
+        render_admin_live_panel(db, tournament)
     if admin_section == "Quick Admin":
         st.subheader("Quick Admin")
-        live = live_poll_monitor(db)
+        live = live_poll_monitor(db, tournament=tournament)
         refresh_col, refreshed_col = st.columns([1, 1])
         if refresh_col.button("REFRESH LIVE POLL", use_container_width=True):
             st.rerun()
@@ -496,11 +519,11 @@ def render_admin(db):
                     )
         quick_counts = rows(db, """
             SELECT
-              (SELECT COUNT(*) FROM fixtures WHERE starts_at>=CURRENT_TIMESTAMP) upcoming,
-              (SELECT COUNT(*) FROM fixtures WHERE poll_state='OPEN') open_count,
-              (SELECT COUNT(DISTINCT person_id) FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.poll_state IN ('OPEN','FROZEN')) responses,
-              (SELECT COUNT(*) FROM assignments WHERE status='REPLACEMENT_REQUIRED') required
-        """)[0]
+              (SELECT COUNT(*) FROM fixtures WHERE tournament=:tournament AND starts_at>=CURRENT_TIMESTAMP) upcoming,
+              (SELECT COUNT(*) FROM fixtures WHERE tournament=:tournament AND poll_state='OPEN') open_count,
+              (SELECT COUNT(DISTINCT person_id) FROM availability a JOIN fixtures f ON f.id=a.fixture_id WHERE f.tournament=:tournament AND f.poll_state IN ('OPEN','FROZEN')) responses,
+              (SELECT COUNT(*) FROM assignments a JOIN fixtures f ON f.id=a.fixture_id WHERE f.tournament=:tournament AND a.status='REPLACEMENT_REQUIRED') required
+        """, {"tournament": tournament})[0]
         cards = st.columns(2)
         for index, (value, label) in enumerate(((quick_counts["upcoming"],"Upcoming Matches"),(quick_counts["open_count"],"Open Poll"),(quick_counts["responses"],"With Availability"),(quick_counts["required"],"Replacement Required"))):
             cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
@@ -515,10 +538,10 @@ def render_admin(db):
         st.markdown("#### Quick actions")
         qa1, qa2 = st.columns(2)
         if qa1.button("FREEZE POLL", key="quick_freeze"):
-            transition_poll_state(db, "OPEN", "FROZEN")
+            transition_poll_state(db, "OPEN", "FROZEN", tournament=tournament)
             st.rerun()
         if qa2.button("GENERATE ALLOCATION", key="quick_generate"):
-            propose(db, regenerate_unconfirmed=True); st.rerun()
+            propose(db, regenerate_unconfirmed=True, tournament=tournament); st.rerun()
         st.markdown("#### + Add match")
         q_date = st.text_input("Date", placeholder="22-Aug-2026", key="quick_date")
         q_time = st.text_input("Time", placeholder="7:00 PM", key="quick_time")
@@ -558,7 +581,7 @@ def render_admin(db):
                         except ValueError as error:
                             st.warning(str(error))
         st.markdown("#### Final allocation")
-        quick_board = allocation_board(db)
+        quick_board = allocation_board(db, tournament=tournament)
         active_names = [person["name"] for person in rows(db,"SELECT name FROM people WHERE active=true ORDER BY name")]
         for match in quick_board:
             with st.container(border=True):
@@ -575,7 +598,7 @@ def render_admin(db):
             st.image(quick_png,use_container_width=True)
             st.download_button("DOWNLOAD PNG",quick_png,"sgia-official-allocation.png","image/png",key="quick_png")
             st.download_button("DOWNLOAD CSV",pd.DataFrame(quick_board)[BOARD_COLUMNS].to_csv(index=False),"sgia-allocation.csv","text/csv",key="quick_csv")
-            st.text_area("COPY WHATSAPP MESSAGE",allocation_message(db),height=220,key="quick_whatsapp")
+            st.text_area("COPY WHATSAPP MESSAGE",allocation_message(db, tournament=tournament),height=220,key="quick_whatsapp")
     if admin_section == "Open Poll":
         st.subheader("Availability schedule")
         st.caption("Prepare upcoming games here. Past dates are hidden automatically; match status is never changed automatically.")
@@ -611,11 +634,11 @@ def render_admin(db):
         st.caption(" · ".join(f"{item['poll_state']}: {item['count']}" for item in state_counts))
         freeze_col, publish_col = st.columns(2)
         if freeze_col.button("Freeze Open Poll", use_container_width=True):
-            transition_poll_state(db, "OPEN", "FROZEN")
+            transition_poll_state(db, "OPEN", "FROZEN", tournament=tournament)
             st.success("Open availability is now frozen.")
             st.rerun()
         if publish_col.button("Publish Frozen Allocation", use_container_width=True):
-            transition_poll_state(db, "FROZEN", "PUBLISHED")
+            transition_poll_state(db, "FROZEN", "PUBLISHED", tournament=tournament)
             st.success("Allocation published. Volunteers can now see their confirmed duties.")
             st.rerun()
         opened = []
@@ -758,26 +781,26 @@ def render_admin(db):
                     st.session_state.fixture_preview = []
     if admin_section == "Allocations":
         st.subheader("Allocation Review")
-        allocation_summary = current_allocation_summary(db)
+        allocation_summary = current_allocation_summary(db, tournament=tournament)
         if allocation_summary:
             st.caption(allocation_cycle_caption(allocation_summary))
         else:
             st.info("No current allocation is being prepared.")
         left, right, confirm_all_col = st.columns(3)
         if left.button("Generate proposed allocation", use_container_width=True):
-            propose(db)
+            propose(db, tournament=tournament)
             st.rerun()
         if right.button("Regenerate unconfirmed only", use_container_width=True):
-            propose(db, regenerate_unconfirmed=True)
+            propose(db, regenerate_unconfirmed=True, tournament=tournament)
             st.rerun()
         if confirm_all_col.button("Confirm all proposed", use_container_width=True):
             try:
-                count = confirm_all_proposed(db)
+                count = confirm_all_proposed(db, tournament=tournament)
                 st.success(f"Confirmed {count} fixture(s).")
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
-        review_rows = allocation_review(db)
+        review_rows = allocation_review(db, tournament=tournament)
         active_people = rows(db, "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY name")
         umpire_names = [person["name"] for person in active_people if person["can_umpire"]]
         scorer_names = [person["name"] for person in active_people if person["can_score"]]
@@ -860,14 +883,14 @@ def render_admin(db):
                                 st.error(str(error))
     if admin_section == "Allocation Board":
         st.subheader("Current Allocation Board")
-        allocation_summary = current_allocation_summary(db)
+        allocation_summary = current_allocation_summary(db, tournament=tournament)
         if allocation_summary:
             st.caption(allocation_cycle_caption(allocation_summary))
         replacements = rows(db, """
             SELECT a.fixture_id,a.role,a.person_id,p.name,f.starts_at,f.home_team,f.away_team
             FROM assignments a JOIN people p ON p.id=a.person_id JOIN fixtures f ON f.id=a.fixture_id
-            WHERE a.status='REPLACEMENT_REQUIRED' ORDER BY f.starts_at,a.role
-        """)
+            WHERE f.tournament=:tournament AND a.status='REPLACEMENT_REQUIRED' ORDER BY f.starts_at,a.role
+        """, {"tournament": tournament})
         if replacements:
             st.error(f"{len(replacements)} assignment(s) require replacement")
             active_people = rows(db, "SELECT id,name FROM people WHERE active=true ORDER BY name")
@@ -888,7 +911,7 @@ def render_admin(db):
                         person_id = next(person["id"] for person in active_people if person["name"] == manual)
                         replace_assignment(db, replacement["fixture_id"], replacement["role"], person_id)
                         st.rerun()
-        board_rows = allocation_board(db)
+        board_rows = allocation_board(db, tournament=tournament)
         if not board_rows:
             if allocation_summary:
                 st.info("Generate proposed allocations first to populate the board.")
@@ -920,7 +943,7 @@ def render_admin(db):
             st.image(png, use_container_width=True)
             st.download_button("Download PNG", png, "sgia-official-allocation.png", "image/png")
             st.download_button("Download Board CSV", edited_board[BOARD_COLUMNS].to_csv(index=False), "sgia-allocation-board.csv", "text/csv")
-        published_cycles = published_allocation_cycles(db)
+        published_cycles = published_allocation_cycles(db, tournament=tournament)
         if published_cycles:
             with st.expander("Published Allocations"):
                 labels = {
@@ -928,7 +951,7 @@ def render_admin(db):
                     for cycle in published_cycles
                 }
                 published_label = st.selectbox("Published cycle", list(labels), key="published_allocation_cycle")
-                published_board = allocation_board(db, confirmed_only=True, cycle_id=labels[published_label]["id"])
+                published_board = allocation_board(db, confirmed_only=True, cycle_id=labels[published_label]["id"], tournament=tournament, published_only=True)
                 if published_board:
                     st.dataframe(pd.DataFrame(published_board)[BOARD_COLUMNS], hide_index=True, use_container_width=True)
                 else:
@@ -1022,10 +1045,10 @@ def render_admin(db):
             st.info("No match status events recorded yet.")
     if admin_section == "Output":
         st.subheader("Final Confirmed Allocation")
-        allocation_summary = current_allocation_summary(db)
+        allocation_summary = current_allocation_summary(db, tournament=tournament)
         if allocation_summary:
             st.caption(allocation_cycle_caption(allocation_summary) + ". Exports include only complete confirmed assignments in this batch.")
-        final_board = confirmed_allocation_board(db, cycle_id=allocation_summary["id"]) if allocation_summary else []
+        final_board = confirmed_allocation_board(db, cycle_id=allocation_summary["id"], tournament=tournament) if allocation_summary else []
         if not allocation_summary:
             st.info("No current allocation is being prepared.")
         elif not final_board:
@@ -1040,7 +1063,7 @@ def render_admin(db):
             png_col.download_button("Download PNG", final_png, "sgia-official-allocation.png", "image/png", use_container_width=True)
             csv_col.download_button("Download CSV", allocation_board_csv(final_board), "sgia-official-allocation.csv", "text/csv", use_container_width=True)
         st.markdown("#### WhatsApp text")
-        message = allocation_message(db, cycle_id=allocation_summary["id"]) if allocation_summary else "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
+        message = allocation_message(db, cycle_id=allocation_summary["id"], tournament=tournament) if allocation_summary else "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
         st.text_area("Copy WhatsApp Message", message, height=360)
 
 
