@@ -871,7 +871,7 @@ def test_live_poll_mobile_admin_contract_is_present():
     assert "REFRESH LIVE POLL" in source
     assert "Yet to Respond" in source
     assert "@media(max-width:700px)" in source
-    assert "live_poll_monitor(db)" in source
+    assert "live_poll_monitor(db, tournament=tournament)" in source
 
 
 def test_poll_cycle_is_persistent_and_revisions_track_fixture_changes():
