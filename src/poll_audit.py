@@ -219,18 +219,23 @@ def set_fixture_poll_state(engine, fixture_id, new_state):
         return cycle_id
 
 
-def transition_poll_state(engine, source, target):
+def transition_poll_state(engine, source, target, tournament=None):
     if (source, target) not in {("OPEN", "FROZEN"), ("FROZEN", "PUBLISHED")}:
         raise ValueError("Unsupported poll transition")
     with engine.begin() as connection:
-        cycle = current_cycle(connection, (source,))
+        cycle = connection.execute(text('''
+            SELECT c.* FROM poll_cycles c WHERE c.status=:source AND EXISTS (
+                SELECT 1 FROM fixtures f WHERE f.poll_cycle_id=c.id AND f.poll_state=:source
+                AND (:tournament IS NULL OR f.tournament=:tournament)
+            ) ORDER BY c.id DESC LIMIT 1
+        '''), {"source": source, "tournament": tournament}).mappings().first()
         if cycle:
             connection.execute(text("""
                 UPDATE fixtures SET poll_state=:target,availability_open=false
-                WHERE poll_state=:source AND poll_cycle_id=:cycle
-            """), {"source": source, "target": target, "cycle": cycle.id})
+                WHERE poll_state=:source AND poll_cycle_id=:cycle AND (:tournament IS NULL OR tournament=:tournament)
+            """), {"source": source, "target": target, "cycle": cycle.id, "tournament": tournament})
             timestamp = "frozen_at" if target == "FROZEN" else "published_at"
-            connection.execute(text(f"UPDATE poll_cycles SET status=:target,{timestamp}=CURRENT_TIMESTAMP WHERE id=:cycle"), {
+            connection.execute(text(f"UPDATE poll_cycles SET status=:target,{timestamp}=CURRENT_TIMESTAMP WHERE id=:cycle AND NOT EXISTS (SELECT 1 FROM fixtures WHERE poll_cycle_id=:cycle AND poll_state=:source)"), {"source": source,
                 "target": target, "cycle": cycle.id,
             })
             return cycle.id
@@ -339,9 +344,15 @@ def _fixture_labels(connection, fixture_ids):
     return result
 
 
-def response_audit(engine, cycle_id=None):
+def response_audit(engine, cycle_id=None, tournament=None):
     with engine.connect() as connection:
         cycle = connection.execute(text("SELECT * FROM poll_cycles WHERE id=:cycle"), {"cycle": cycle_id}).mappings().first() if cycle_id else current_cycle(connection)
+        if tournament is not None and cycle_id is None:
+            cycle = connection.execute(text("""
+                SELECT c.* FROM poll_cycles c WHERE EXISTS (
+                    SELECT 1 FROM fixtures f WHERE f.poll_cycle_id=c.id AND f.tournament=:tournament
+                ) ORDER BY CASE c.status WHEN 'OPEN' THEN 1 WHEN 'FROZEN' THEN 2 ELSE 3 END,c.id DESC LIMIT 1
+            """), {"tournament": tournament}).mappings().first()
         if not cycle:
             return {"cycle": None, "people": []}
         people = list(connection.execute(text("""
@@ -352,15 +363,22 @@ def response_audit(engine, cycle_id=None):
               ON x.person_id=p.id AND x.poll_cycle_id=:cycle
             WHERE p.active=true ORDER BY p.name
         """), {"cycle": cycle.id}).mappings())
+        scoped_ids = None
+        if tournament is not None:
+            scoped_ids = {row.id for row in connection.execute(text(
+                "SELECT id FROM fixtures WHERE poll_cycle_id=:cycle AND tournament=:tournament"
+            ), {"cycle": cycle.id, "tournament": tournament})}
         result = []
         for person in people:
             submissions = int(person.submission_count or 0)
             selected_ids = _parse_ids(person.selected_fixture_ids)
+            if scoped_ids is not None:
+                selected_ids = [fid for fid in selected_ids if fid in scoped_ids]
             if not submissions and not person.first_viewed_at:
                 status = "NOT OPENED"
             elif not submissions:
                 status = "VIEWED — NOT SUBMITTED"
-            elif int(person.selected_count or 0) == 0:
+            elif len(selected_ids) == 0:
                 status = "RESPONDED — NOT AVAILABLE"
             elif submissions > 1:
                 status = "UPDATED"
@@ -372,7 +390,7 @@ def response_audit(engine, cycle_id=None):
                 "First Viewed SGT": _sgt(person.first_viewed_at),
                 "First Submitted SGT": _sgt(person.first_submitted_at),
                 "Last Updated SGT": _sgt(person.last_submitted_at),
-                "Submission Count": submissions, "Selected Count": int(person.selected_count or 0),
+                "Submission Count": submissions, "Selected Count": len(selected_ids),
                 "Current Selections": _fixture_labels(connection, selected_ids),
                 "Needs Review": needs_review, "Device": person.device_type or "Unknown",
                 "Browser": person.browser or "Other", "Evidence Source": person.evidence_source or "",
