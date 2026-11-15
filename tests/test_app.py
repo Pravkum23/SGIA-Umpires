@@ -701,11 +701,11 @@ def test_completed_workload_counts_distinct_fixture_roles_and_scorer():
     assert stats["total_assigned"] == 1
 
 
-def test_cancelled_and_directly_restored_completed_fixture_reverse_workload():
+def test_cancelled_and_future_rescheduled_fixture_reverse_workload():
     engine = db()
     person = rows(engine, "SELECT id FROM people WHERE name='Malo'")[0]["id"]
     with engine.begin() as connection:
-        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED' WHERE id=1"))
+        connection.execute(text("UPDATE fixtures SET poll_state='PUBLISHED',starts_at='2099-01-01 11:00:00' WHERE id=1"))
         connection.execute(text("INSERT INTO assignments(fixture_id,role,person_id,confirmed,status) VALUES(1,'umpire_2',:person,true,'ASSIGNED')"), {"person": person})
     set_match_status(engine, 1, "COMPLETED")
     assert season_workload(engine, person)[0]["games_completed"] == 1
@@ -1080,3 +1080,24 @@ def test_legacy_evidence_never_fabricates_view_history():
     imported = rows(engine, "SELECT first_viewed_at,evidence_source FROM poll_participation WHERE person_id=100")[0]
     assert imported == {"first_viewed_at": None, "evidence_source": "LEGACY_BACKFILL"}
     assert rows(engine, "SELECT event_type FROM poll_activity_events WHERE person_id=100") == [{"event_type": "LEGACY_IMPORTED"}]
+
+def test_four_prior_allocations_count_automatically_in_both_workload_views():
+    engine = db()
+    person = rows(engine, "SELECT id FROM people ORDER BY id LIMIT 1")[0]["id"]
+    with engine.begin() as connection:
+        for fixture, day, hour in [(1, -5, 19), (2, -3, 19), (3, -1, 11), (4, -1, 15)]:
+            connection.execute(text("""
+                UPDATE fixtures SET starts_at=datetime(date('now','+8 hours'), :day, :hour),
+                    poll_state=:state WHERE id=:id
+            """), {"day": f"{day} days", "hour": f"+{hour} hours", "state": "FROZEN" if fixture==4 else "PUBLISHED", "id": fixture})
+            connection.execute(text("""
+                INSERT INTO assignments(fixture_id,role,person_id,confirmed)
+                VALUES(:id,'umpire_1',:person,true)
+            """), {"id": fixture, "person": person})
+    for tournament in (None, "SHL4"):
+        stats = season_workload(engine, person, tournament)[0]
+        assert stats["games_completed"] == stats["umpire_completed"] == stats["total_assigned"] == 4
+    set_match_status(engine, 1, "COMPLETED")
+    assert season_workload(engine, person)[0]["games_completed"] == 4
+    set_match_status(engine, 1, "CANCELLED")
+    assert season_workload(engine, person)[0]["games_completed"] == 3

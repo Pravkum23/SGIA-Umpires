@@ -124,19 +124,22 @@ def initialize(engine):
                 """), {"key": key})
         from .poll_audit import migrate_legacy_evidence
         migrate_legacy_evidence(c)
+        from .workload import workload_totals
+        now = ("CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Singapore'" if engine.dialect.name == "postgresql"
+               else "datetime('now','+8 hours')")
         c.execute(text("DROP VIEW IF EXISTS season_workload"))
-        c.execute(text("""
-            CREATE VIEW season_workload AS
-            SELECT p.id person_id,p.name,
-              COUNT(DISTINCT CASE WHEN f.match_status='COMPLETED' AND a.confirmed=true AND a.status='ASSIGNED' THEN f.id END) games_completed,
-              COUNT(DISTINCT CASE WHEN f.match_status='COMPLETED' AND a.confirmed=true AND a.status='ASSIGNED' AND a.role IN ('umpire_1','umpire_2') THEN f.id END) umpire_completed,
-              COUNT(DISTINCT CASE WHEN f.match_status='COMPLETED' AND a.confirmed=true AND a.status='ASSIGNED' AND a.role='scorer' THEN f.id END) scorer_completed,
-              COUNT(DISTINCT CASE WHEN f.match_status='SCHEDULED' AND f.poll_state='PUBLISHED' AND f.starts_at>CURRENT_TIMESTAMP AND a.confirmed=true AND a.status='ASSIGNED' THEN f.id END) upcoming_duties,
-              COUNT(DISTINCT CASE WHEN f.match_status='COMPLETED' AND a.confirmed=true AND a.status='ASSIGNED' THEN f.id END)
-                + COUNT(DISTINCT CASE WHEN f.match_status='SCHEDULED' AND f.poll_state='PUBLISHED' AND f.starts_at>CURRENT_TIMESTAMP AND a.confirmed=true AND a.status='ASSIGNED' THEN f.id END) total_assigned
-            FROM people p LEFT JOIN assignments a ON a.person_id=p.id LEFT JOIN fixtures f ON f.id=a.fixture_id
-            WHERE p.active=true GROUP BY p.id,p.name
+        c.execute(text("DROP VIEW IF EXISTS workload_duties"))
+        c.execute(text(f"""
+            CREATE VIEW workload_duties AS
+            SELECT a.person_id, f.id fixture_id, f.tournament, a.role,
+                CASE WHEN f.match_status='COMPLETED' OR DATE(f.starts_at)<DATE({now}) THEN 'completed'
+                     WHEN f.starts_at>({now}) THEN 'upcoming' ELSE 'started' END AS duty_state
+            FROM assignments a JOIN fixtures f ON f.id=a.fixture_id
+            WHERE a.confirmed=true AND a.status='ASSIGNED'
+              AND (f.match_status='COMPLETED' OR (f.match_status='SCHEDULED'
+                   AND (f.poll_state='PUBLISHED' OR DATE(f.starts_at)<DATE({now}))))
         """))
+        c.execute(text("CREATE VIEW season_workload AS " + workload_totals()))
 
 def rows(engine, sql, params=None):
     with engine.connect() as c: return [dict(r) for r in c.execute(text(sql), params or {}).mappings()]

@@ -9,37 +9,36 @@ EVENT_BY_STATUS = {
 }
 
 
+def workload_totals(tournament_filter=False):
+    scope = " AND d.tournament=:tournament" if tournament_filter else ""
+    return f"""
+        SELECT p.id person_id,p.name,
+          COUNT(DISTINCT CASE WHEN d.duty_state='completed' THEN d.fixture_id END) games_completed,
+          COUNT(DISTINCT CASE WHEN d.duty_state='completed' AND d.role IN ('umpire_1','umpire_2') THEN d.fixture_id END) umpire_completed,
+          COUNT(DISTINCT CASE WHEN d.duty_state='completed' AND d.role='scorer' THEN d.fixture_id END) scorer_completed,
+          COUNT(DISTINCT CASE WHEN d.duty_state='upcoming' THEN d.fixture_id END) upcoming_duties,
+          COUNT(DISTINCT d.fixture_id) total_assigned,
+          COUNT(DISTINCT CASE WHEN d.duty_state='started' THEN d.fixture_id END) awaiting_completion
+        FROM people p LEFT JOIN workload_duties d ON d.person_id=p.id{scope}
+        WHERE p.active=true GROUP BY p.id,p.name
+    """
+
+
 def season_workload(engine, person_id=None, tournament=None):
-    """Return the shared current-season workload view, ordered for fair allocation."""
+    source = "season_workload"
+    params = {}
     if tournament is not None:
-        from .weekly import singapore_now
-        with engine.connect() as connection:
-            return [dict(row) for row in connection.execute(text("""
-                WITH duties AS (
-                    SELECT a.person_id, f.id, a.role, f.match_status, f.starts_at
-                    FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
-                    WHERE f.tournament=:tournament AND a.confirmed=true AND a.status='ASSIGNED'
-                      AND (f.match_status='COMPLETED' OR (f.poll_state='PUBLISHED' AND f.match_status='SCHEDULED'))
-                )
-                SELECT p.id person_id, p.name,
-                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' THEN d.id END) games_completed,
-                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' AND d.role IN ('umpire_1','umpire_2') THEN d.id END) umpire_completed,
-                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' AND d.role='scorer' THEN d.id END) scorer_completed,
-                    COUNT(DISTINCT CASE WHEN d.match_status='SCHEDULED' AND d.starts_at>:now THEN d.id END) upcoming_duties,
-                    COUNT(DISTINCT CASE WHEN d.match_status='SCHEDULED' AND d.starts_at<=:now THEN d.id END) awaiting_completion,
-                    COUNT(DISTINCT d.id) total_assigned
-                FROM people p LEFT JOIN duties d ON d.person_id=p.id
-                WHERE p.active=true AND (CAST(:person AS INTEGER) IS NULL OR p.id=:person)
-                GROUP BY p.id,p.name ORDER BY total_assigned DESC,p.name
-            """), {"tournament": tournament, "person": person_id, "now": singapore_now()}).mappings()]
-    where = " WHERE person_id=:person" if person_id is not None else ""
+        source = "(" + workload_totals(tournament_filter=True) + ") scoped"
+        params["tournament"] = tournament
+    where = ""
+    if person_id is not None:
+        where = " WHERE person_id=:person"
+        params["person"] = person_id
+    order = "total_assigned DESC,name" if tournament is not None else "games_completed,total_assigned,name"
     with engine.connect() as connection:
-        return [dict(row) for row in connection.execute(text(f"""
-            SELECT person_id,name,games_completed,umpire_completed,scorer_completed,
-                   upcoming_duties,total_assigned
-            FROM season_workload{where}
-            ORDER BY games_completed,total_assigned,name
-        """), {"person": person_id} if person_id is not None else {}).mappings()]
+        return [dict(row) for row in connection.execute(
+            text(f"SELECT * FROM {source}{where} ORDER BY {order}"), params
+        ).mappings()]
 
 
 def set_match_status(engine, fixture_id, new_status):

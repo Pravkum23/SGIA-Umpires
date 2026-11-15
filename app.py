@@ -988,12 +988,12 @@ def render_admin(db):
                 st.error(str(error))
     if admin_section == "Season Workload":
         st.subheader(f"{tournament} · Season Workload")
-        st.caption("Upcoming counts published duties. After a match starts, its duties appear under Awaiting completion until you mark the match completed.")
+        st.caption("Confirmed allocations count as completed from midnight after match day (Singapore time). Cancelled matches are excluded. You can mark a match completed earlier on match day.")
         pending = rows(db, """
             SELECT id,starts_at,home_team,away_team FROM fixtures
             WHERE tournament=:tournament AND match_status='SCHEDULED' AND poll_state='PUBLISHED'
-              AND starts_at<=:now ORDER BY starts_at DESC
-        """, {"tournament": tournament, "now": singapore_now()})
+              AND starts_at>=:today AND starts_at<=:now ORDER BY starts_at DESC
+        """, {"tournament": tournament, "now": singapore_now(), "today": singapore_now().date()})
         if pending:
             with st.expander(f"Mark a played match completed ({len(pending)})"):
                 match = st.selectbox("Played match", pending, format_func=lambda f:
