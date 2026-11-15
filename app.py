@@ -88,7 +88,8 @@ if ADMIN_MODE:
 
 
 @st.cache_resource
-def engine():
+def engine(schema_version):
+    """Initialize once per database schema version, including after a live code update."""
     value = get_engine()
     initialize(value)
     return value
@@ -1081,7 +1082,7 @@ def render_admin(db):
         st.text_area("Copy WhatsApp Message", message, height=360)
 
 
-db = engine()
+db = engine(schema_version="workload-duties-v1")
 if ADMIN_MODE:
     render_admin(db)
 else:
