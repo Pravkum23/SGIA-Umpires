@@ -67,7 +67,7 @@ def enable_week(engine, tournament, start, end, fixture_ids=None):
     with engine.begin() as connection:
         if engine.dialect.name == "postgresql":
             connection.execute(text("LOCK TABLE poll_cycles IN SHARE ROW EXCLUSIVE MODE"))
-        eligible = WEEK_FILTER + " AND starts_at>:now AND poll_state='CLOSED'" + selected
+        eligible = WEEK_FILTER + " AND starts_at>:now AND poll_state IN ('CLOSED','FROZEN')" + selected
         count = connection.execute(text(f"SELECT COUNT(*) FROM fixtures WHERE {eligible}"), scope).scalar_one()
         if not count:
             return

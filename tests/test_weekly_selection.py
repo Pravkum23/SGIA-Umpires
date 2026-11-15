@@ -118,3 +118,20 @@ def test_weekly_admin_selection_and_tournament_switch(monkeypatch, tmp_path):
     assert not list(page.exception)
     page.selectbox(key="admin_tournament").set_value("SHL4").run(timeout=30)
     assert not list(page.exception)
+
+def test_enable_mixed_selection_reopens_only_eligible_matches():
+    engine, start, end, ids = setup_week()
+    enable_week(engine, "SHL5", start, end)
+    allocate(engine, [ids["Tuesday"], ids["Saturday"]])
+    close_week(engine, "SHL5", start, end, [ids["Tuesday"], ids["Saturday"]])
+    reopen_selected(engine, "SHL5", start, end, [ids["Saturday"]])
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO availability(person_id,fixture_id) VALUES(1,:id)"), {"id": ids["Saturday"]})
+    assignments = rows(engine, "SELECT * FROM assignments ORDER BY fixture_id,role")
+    enable_week(engine, "SHL5", start, end, list(ids.values()))
+    enable_week(engine, "SHL5", start, end, list(ids.values()))
+    assert state(engine, ids["Tuesday"]) == "PUBLISHED"
+    assert state(engine, ids["Saturday"]) == state(engine, ids["Sunday"]) == "OPEN"
+    assert state(engine, ids["Old league"]) == "CLOSED"
+    assert rows(engine, "SELECT person_id FROM availability WHERE fixture_id=:id", {"id": ids["Saturday"]}) == [{"person_id": 1}]
+    assert assignments == rows(engine, "SELECT * FROM assignments ORDER BY fixture_id,role")

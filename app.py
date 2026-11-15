@@ -334,9 +334,11 @@ def render_week(db, tournament):
         key=f"{selection_key}_{preset}")
     selected_matches = [lookup[fid] for fid in selected_ids]
     if st.button("Enable selected matches", type="primary",
-                 disabled=not any(f["poll_state"] == "CLOSED" for f in selected_matches)):
+                 disabled=not any(f["poll_state"] in ("CLOSED", "FROZEN") for f in selected_matches)):
         enable_week(db, tournament, start, end, selected_ids)
         st.rerun()
+    if selected_matches and all(f["poll_state"] == "OPEN" for f in selected_matches):
+        st.caption("All selected matches are already collecting availability.")
     if st.button("Unpublish selected matches",
                  disabled=not any(f["poll_state"] == "PUBLISHED" for f in selected_matches)):
         reopen_selected(db, tournament, start, end, selected_ids)
