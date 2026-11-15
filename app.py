@@ -405,7 +405,7 @@ def render_admin(db):
                     st.error(str(error))
     # Streamlit tabs eagerly execute every panel on every widget interaction.
     # Conditional navigation keeps Supabase work limited to the visible page.
-    admin_sections = ["Weekly matches", "Fixtures", "More tools"]
+    admin_sections = ["Weekly matches", "Fixtures", "Season Workload", "More tools"]
     admin_section = st.radio(
         "Admin section",
         admin_sections,
@@ -530,7 +530,7 @@ def render_admin(db):
         for index, (value, label) in enumerate(((quick_counts["upcoming"],"Upcoming Matches"),(quick_counts["open_count"],"Open Poll"),(quick_counts["responses"],"With Availability"),(quick_counts["required"],"Replacement Required"))):
             cards[index % 2].markdown(f'<div class="quick-card"><div class="quick-number">{value}</div><div class="quick-label">{label}</div></div>', unsafe_allow_html=True)
         st.markdown("#### Season workload")
-        for person in season_workload(db)[:5]:
+        for person in season_workload(db, tournament=tournament)[:5]:
             st.markdown(
                 f'<div class="quick-card"><strong>{person["name"]}</strong><br>'
                 f'<span class="quick-label">Completed {person["games_completed"]} · Umpire {person["umpire_completed"]} · '
@@ -987,18 +987,30 @@ def render_admin(db):
             except ValueError as error:
                 st.error(str(error))
     if admin_section == "Season Workload":
-        st.subheader("Season Workload")
-        st.caption("Completed work counts only confirmed, active duties on matches marked COMPLETED. Workload is used only as an allocation tie-breaker.")
+        st.subheader(f"{tournament} · Season Workload")
+        st.caption("Upcoming counts published duties. After a match starts, its duties appear under Awaiting completion until you mark the match completed.")
+        pending = rows(db, """
+            SELECT id,starts_at,home_team,away_team FROM fixtures
+            WHERE tournament=:tournament AND match_status='SCHEDULED' AND poll_state='PUBLISHED'
+              AND starts_at<=:now ORDER BY starts_at DESC
+        """, {"tournament": tournament, "now": singapore_now()})
+        if pending:
+            with st.expander(f"Mark a played match completed ({len(pending)})"):
+                match = st.selectbox("Played match", pending, format_func=lambda f:
+                    f"{date_label(f['starts_at'])} · {f['home_team']} vs {f['away_team']}", key=f"workload_match_{tournament}")
+                if st.button("Mark match completed", key=f"complete_{match['id']}"):
+                    set_match_status(db, match["id"], "COMPLETED")
+                    st.rerun()
         workload_search = st.text_input("Search person", key="workload_search").strip().lower()
-        workload = season_workload(db)
+        workload = season_workload(db, tournament=tournament)
         if workload_search:
             workload = [person for person in workload if workload_search in person["name"].lower()]
         workload_frame = pd.DataFrame(workload).rename(columns={
             "name": "Person", "games_completed": "Completed", "umpire_completed": "Umpire",
-            "scorer_completed": "Scorer", "upcoming_duties": "Upcoming", "total_assigned": "Total Assigned",
+            "scorer_completed": "Scorer", "upcoming_duties": "Upcoming", "total_assigned": "Total Assigned", "awaiting_completion": "Awaiting completion",
         })
         if not workload_frame.empty:
-            desktop_columns = ["Person", "Completed", "Umpire", "Scorer", "Upcoming", "Total Assigned"]
+            desktop_columns = ["Person", "Completed", "Umpire", "Scorer", "Upcoming", "Awaiting completion", "Total Assigned"]
             st.dataframe(workload_frame[desktop_columns], hide_index=True, use_container_width=True)
             st.download_button("Download Workload CSV", workload_frame[desktop_columns].to_csv(index=False), "sgia-season-workload.csv", "text/csv")
             st.markdown("#### Mobile summary")
@@ -1006,7 +1018,7 @@ def render_admin(db):
                 st.markdown(
                     f'<div class="quick-card"><strong>{person["name"]}</strong><br>Completed {person["games_completed"]}<br>'
                     f'<span class="quick-label">Umpire {person["umpire_completed"]} | Scorer {person["scorer_completed"]}<br>'
-                    f'Upcoming {person["upcoming_duties"]} · Total {person["total_assigned"]}</span></div>',
+                    f'Upcoming {person["upcoming_duties"]} · Awaiting completion {person["awaiting_completion"]} · Total {person["total_assigned"]}</span></div>',
                     unsafe_allow_html=True,
                 )
         else:

@@ -9,8 +9,29 @@ EVENT_BY_STATUS = {
 }
 
 
-def season_workload(engine, person_id=None):
+def season_workload(engine, person_id=None, tournament=None):
     """Return the shared current-season workload view, ordered for fair allocation."""
+    if tournament is not None:
+        from .weekly import singapore_now
+        with engine.connect() as connection:
+            return [dict(row) for row in connection.execute(text("""
+                WITH duties AS (
+                    SELECT a.person_id, f.id, a.role, f.match_status, f.starts_at
+                    FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
+                    WHERE f.tournament=:tournament AND a.confirmed=true AND a.status='ASSIGNED'
+                      AND (f.match_status='COMPLETED' OR (f.poll_state='PUBLISHED' AND f.match_status='SCHEDULED'))
+                )
+                SELECT p.id person_id, p.name,
+                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' THEN d.id END) games_completed,
+                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' AND d.role IN ('umpire_1','umpire_2') THEN d.id END) umpire_completed,
+                    COUNT(DISTINCT CASE WHEN d.match_status='COMPLETED' AND d.role='scorer' THEN d.id END) scorer_completed,
+                    COUNT(DISTINCT CASE WHEN d.match_status='SCHEDULED' AND d.starts_at>:now THEN d.id END) upcoming_duties,
+                    COUNT(DISTINCT CASE WHEN d.match_status='SCHEDULED' AND d.starts_at<=:now THEN d.id END) awaiting_completion,
+                    COUNT(DISTINCT d.id) total_assigned
+                FROM people p LEFT JOIN duties d ON d.person_id=p.id
+                WHERE p.active=true AND (CAST(:person AS INTEGER) IS NULL OR p.id=:person)
+                GROUP BY p.id,p.name ORDER BY total_assigned DESC,p.name
+            """), {"tournament": tournament, "person": person_id, "now": singapore_now()}).mappings()]
     where = " WHERE person_id=:person" if person_id is not None else ""
     with engine.connect() as connection:
         return [dict(row) for row in connection.execute(text(f"""
