@@ -972,6 +972,19 @@ def render_admin(db):
                 published_board = allocation_board(db, confirmed_only=True, cycle_id=labels[published_label]["id"], tournament=tournament, published_only=True)
                 if published_board:
                     st.dataframe(pd.DataFrame(published_board)[BOARD_COLUMNS], hide_index=True, use_container_width=True)
+                    by_id = {r["fixture_id"]: r for r in published_board}
+                    def fixture_label(fid):
+                        r = by_id[fid]
+                        return f"{r['Day']} {r['Date']} · {r['Time']} · {r['TEAM 1']} vs {r['TEAM 2']}"
+                    chosen = st.multiselect("Matches to share", list(by_id), default=list(by_id),
+                                            format_func=fixture_label,
+                                            key=f"published_share_{tournament}_{labels[published_label]['id']}")
+                    selected = [r for r in published_board if r["fixture_id"] in chosen]
+                    if selected:
+                        png = allocation_board_png(selected, "assets/sgia-logo.png")
+                        st.image(png, caption="SGIA Official · Published allocation", use_container_width=True)
+                        st.download_button("Download published allocation PNG", png,
+                                           f"{tournament}-{selected[0]['Date']}-allocation.png", "image/png")
                 else:
                     st.info("This published cycle has no confirmed allocation rows.")
     if admin_section == "People":
