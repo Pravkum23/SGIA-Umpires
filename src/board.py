@@ -58,23 +58,32 @@ def allocation_board(engine, confirmed_only=False, cycle_id=None, tournament=Non
     return list(board.values())
 
 
-def allocation_review(engine, cycle_id=None, tournament=None):
+def allocation_review(engine, cycle_id=None, tournament=None, week=None):
     """Return one editable review row per fixture with all three roles together."""
     with engine.connect() as connection:
-        if cycle_id is None:
+        if week is None and cycle_id is None:
             cycle = current_allocation_cycle(connection, tournament)
             if not cycle:
                 return []
             cycle_id = cycle.id
-        data = list(connection.execute(text("""
+        if week is None:
+            scope = "f.poll_cycle_id=:cycle"
+            join = "JOIN"
+            params = {"cycle": cycle_id}
+        else:
+            scope = "f.starts_at>=:start AND f.starts_at<:end AND f.match_status='SCHEDULED'"
+            join = "LEFT JOIN"
+            params = {"start": week[0], "end": week[1]}
+        params["tournament"] = tournament
+        data = list(connection.execute(text(f"""
             SELECT f.id fixture_id,f.starts_at,f.home_team,f.away_team,a.role,p.name,
                    a.confirmed,a.reason,a.status assignment_status
-            FROM fixtures f JOIN assignments a ON a.fixture_id=f.id
-            JOIN people p ON p.id=a.person_id
-            WHERE f.poll_cycle_id=:cycle AND f.poll_state IN ('OPEN','FROZEN')
+            FROM fixtures f {join} assignments a ON a.fixture_id=f.id
+            {join} people p ON p.id=a.person_id
+            WHERE {scope} AND f.poll_state IN ('OPEN','FROZEN')
               AND (:tournament IS NULL OR f.tournament=:tournament)
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id, "tournament": tournament}).mappings())
+        """), params).mappings())
     review = {}
     for row in data:
         starts = _dt(row.starts_at)
@@ -98,7 +107,9 @@ def allocation_review(engine, cycle_id=None, tournament=None):
         statuses = item.pop("_statuses")
         confirmed = item.pop("_confirmed")
         item["Reason"] = "; ".join(item["Reason"])
-        if "REPLACEMENT_REQUIRED" in statuses:
+        if statuses == [None]:
+            item["Status"] = "Awaiting allocation"
+        elif "REPLACEMENT_REQUIRED" in statuses:
             item["Status"] = "Replacement Required"
         elif len(confirmed) == 3 and all(confirmed):
             item["Status"] = "Confirmed"

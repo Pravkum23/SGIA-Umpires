@@ -114,6 +114,12 @@ def test_weekly_admin_selection_and_tournament_switch(monkeypatch, tmp_path):
     assert not list(page.exception)
     assert rows(engine, "SELECT home_team FROM fixtures WHERE tournament='SHL5' AND poll_state='OPEN'") == [{"home_team": "Tuesday"}]
     page.radio(key="admin_navigation").set_value("More tools").run(timeout=30)
+    page.date_input(key="allocation_review_date").set_value(start.date()).run(timeout=30)
+    page.radio(key="allocation_review_period").set_value("Tuesday–Friday").run(timeout=30)
+    assert not list(page.exception)
+    table = page.dataframe[-1].value
+    assert list(table["Team 1"]) == ["Tuesday"]
+    assert list(table["Status"]) == ["Awaiting allocation"]
     next(s for s in page.selectbox if s.label == "Tool").set_value("Quick Admin").run(timeout=30)
     assert not list(page.exception)
     page.selectbox(key="admin_tournament").set_value("SHL4").run(timeout=30)
@@ -135,3 +141,14 @@ def test_enable_mixed_selection_reopens_only_eligible_matches():
     assert state(engine, ids["Old league"]) == "CLOSED"
     assert rows(engine, "SELECT person_id FROM availability WHERE fixture_id=:id", {"id": ids["Saturday"]}) == [{"person_id": 1}]
     assert assignments == rows(engine, "SELECT * FROM assignments ORDER BY fixture_id,role")
+
+
+def test_weekday_review_includes_unassigned_matches_across_cycles():
+    engine, start, end, ids = setup_week()
+    enable_week(engine, "SHL5", start, end)
+    allocate(engine, [ids["Saturday"]])
+    with engine.begin() as c:
+        c.execute(text("UPDATE fixtures SET poll_state='FROZEN' WHERE id=:id"), {"id": ids["Saturday"]})
+    review = allocation_review(engine, tournament="SHL5", week=(start + timedelta(days=1), start + timedelta(days=5)))
+    assert [(r["fixture_id"], r["Status"]) for r in review] == [(ids["Tuesday"], "Awaiting allocation")]
+    assert review[0]["Umpire 1"] == ""

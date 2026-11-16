@@ -784,31 +784,45 @@ def render_admin(db):
                     st.session_state.fixture_preview = []
     if admin_section == "Allocations":
         st.subheader("Allocation Review")
-        allocation_summary = current_allocation_summary(db, tournament=tournament)
-        if allocation_summary:
-            st.caption(allocation_cycle_caption(allocation_summary))
-        else:
-            st.info("No current allocation is being prepared.")
+        now = singapore_now()
+        day = st.date_input("Week containing", now.date(), key="allocation_review_date")
+        start, end = week_bounds(day)
+        period = st.radio("Matches to review", ["Entire week", "Tuesday–Friday", "Saturday–Sunday"],
+                          horizontal=True, key="allocation_review_period")
+        if period == "Tuesday–Friday":
+            start, end = start + timedelta(days=1), start + timedelta(days=5)
+        elif period == "Saturday–Sunday":
+            start += timedelta(days=5)
+        start = max(start, now)
+        st.caption(f"{tournament} · Upcoming matches through {end - timedelta(days=1):%a %d %b}")
+        scheduled = rows(db, f"""
+            SELECT starts_at,home_team,away_team,poll_state FROM fixtures
+            WHERE {WEEK_FILTER} ORDER BY starts_at
+        """, {"tournament": tournament, "start": start, "end": end})
+        for match in scheduled:
+            if match["poll_state"] in ("CLOSED", "PUBLISHED"):
+                state = "Enable in Weekly matches" if match["poll_state"] == "CLOSED" else "Allocation published"
+                st.write(f"{date_label(match['starts_at'])} · {match['home_team']} vs {match['away_team']} · {state}")
+        review_rows = allocation_review(db, tournament=tournament, week=(start, end))
         left, right, confirm_all_col = st.columns(3)
-        if left.button("Generate proposed allocation", use_container_width=True):
-            propose(db, tournament=tournament)
+        if left.button("Generate proposed allocation", disabled=not review_rows, use_container_width=True):
+            propose(db, week=(tournament, start, end))
             st.rerun()
-        if right.button("Regenerate unconfirmed only", use_container_width=True):
-            propose(db, regenerate_unconfirmed=True, tournament=tournament)
+        if right.button("Regenerate unconfirmed only", disabled=not review_rows, use_container_width=True):
+            propose(db, regenerate_unconfirmed=True, week=(tournament, start, end))
             st.rerun()
-        if confirm_all_col.button("Confirm all proposed", use_container_width=True):
+        proposed = [r for r in review_rows if r["Status"] == "Proposed"]
+        if confirm_all_col.button("Confirm all proposed", disabled=not proposed, use_container_width=True):
             try:
-                count = confirm_all_proposed(db, tournament=tournament)
-                st.success(f"Confirmed {count} fixture(s).")
+                save_allocation_review(db, proposed, confirm=True)
                 st.rerun()
             except ValueError as error:
                 st.error(str(error))
-        review_rows = allocation_review(db, tournament=tournament)
         active_people = rows(db, "SELECT id,name,can_umpire,can_score FROM people WHERE active=true ORDER BY name")
         umpire_names = [person["name"] for person in active_people if person["can_umpire"]]
         scorer_names = [person["name"] for person in active_people if person["can_score"]]
         if not review_rows:
-            st.info("Generate proposed allocations to begin review.")
+            st.info("No upcoming matches are awaiting allocation for these dates.")
         else:
             desktop_frame = pd.DataFrame(review_rows)
             with st.container(key="desktop_allocation_review"):
@@ -824,7 +838,7 @@ def render_admin(db):
                         "Umpire 2": st.column_config.SelectboxColumn("Umpire 2", options=umpire_names, required=True),
                         "Scorer": st.column_config.SelectboxColumn("Scorer", options=scorer_names, required=True),
                     },
-                    key="allocation_review_table",
+                    key=f"allocation_review_table_{tournament}_{day}_{period}_{tuple(r['fixture_id'] for r in review_rows)}",
                 )
                 edited_records = edited_review.to_dict("records")
                 action_labels = [f"{record['Date']} · {record['Time']} · {record['Team 1']} vs {record['Team 2']}" for record in edited_records]
@@ -866,7 +880,8 @@ def render_admin(db):
                         st.write(f"{review['Team 1']} vs {review['Team 2']}")
                         mobile = dict(review)
                         for column, options in (("Umpire 1", umpire_names), ("Umpire 2", umpire_names), ("Scorer", scorer_names)):
-                            current = review[column] if review[column] in options else options[0]
+                            options = [""] + options
+                            current = review[column] if review[column] in options else ""
                             mobile[column] = st.selectbox(column, options, index=options.index(current), key=f"mobile_review_{review['fixture_id']}_{column}")
                         st.caption(f"{review['Status']} · {review['Reason'] or 'Manual selection'}")
                         save_row, confirm_row = st.columns(2)
