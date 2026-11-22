@@ -32,6 +32,7 @@ from src.lifecycle import assignment_history, authenticate_person, confirm_assig
 from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
+from src.availability_schedule import open_due_availability
 from src.weekly import WEEK_FILTER, close_week, enable_week, reopen_selected, singapore_now, week_bounds
 from src.workload import fixture_history, season_workload, set_match_status
 from src.tournaments import create_tournament
@@ -306,6 +307,8 @@ def render_admin_live_panel(db, tournament):
 
 
 def render_week(db, tournament):
+    if tournament == "SHL5":
+        st.caption("Automatic availability · Friday 9 PM for next Tuesday–Friday · Monday 6 PM for Saturday–Sunday · Singapore time")
     now = singapore_now()
     day = st.date_input("Week containing", now.date(), key="weekly_date")
     start, end = week_bounds(day)
@@ -1111,6 +1114,15 @@ def render_admin(db):
 
 
 db = engine(schema_version="workload-duties-v1")
+
+
+@st.fragment(run_every="60s")
+def check_availability_schedule():
+    if open_due_availability(db):
+        st.rerun()
+
+
+check_availability_schedule()
 if ADMIN_MODE:
     render_admin(db)
 else:

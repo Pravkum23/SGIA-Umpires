@@ -95,7 +95,7 @@ def test_weekly_admin_selection_and_tournament_switch(monkeypatch, tmp_path):
     engine = create_engine(f"sqlite:///{db_path}")
     initialize(engine)
     create_tournament(engine, "SHL5")
-    start, end = week_bounds(date.today() + timedelta(days=7))
+    start, end = week_bounds(date.today() + timedelta(days=14))
     add_fixture(engine, (start + timedelta(days=1)).strftime("%d-%b-%Y"), "7:00 PM", "Tuesday", "Opponent", tournament="SHL5")
     add_fixture(engine, (start + timedelta(days=5)).strftime("%d-%b-%Y"), "7:00 PM", "Saturday", "Opponent", tournament="SHL5")
     monkeypatch.setenv("SGIA_SQLITE_PATH", str(db_path))

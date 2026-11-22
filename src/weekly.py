@@ -61,16 +61,18 @@ def close_week(engine, tournament, start, end, fixture_ids=None):
             """), {"cycle": cycle})
 
 
-def enable_week(engine, tournament, start, end, fixture_ids=None):
+def enable_week(engine, tournament, start, end, fixture_ids=None, *, unopened_only=False):
     scope = {"tournament": tournament, "start": start, "end": end, "now": singapore_now()}
     selected = selected_filter(fixture_ids, scope)
     with engine.begin() as connection:
         if engine.dialect.name == "postgresql":
             connection.execute(text("LOCK TABLE poll_cycles IN SHARE ROW EXCLUSIVE MODE"))
         eligible = WEEK_FILTER + " AND starts_at>:now AND poll_state IN ('CLOSED','FROZEN')" + selected
+        if unopened_only:
+            eligible += " AND poll_state='CLOSED' AND poll_cycle_id IS NULL"
         count = connection.execute(text(f"SELECT COUNT(*) FROM fixtures WHERE {eligible}"), scope).scalar_one()
         if not count:
-            return
+            return 0
         cycle = current_cycle(connection, ("OPEN",))
         scope["cycle"] = cycle.id if cycle else _insert_cycle(connection)
         result = connection.execute(text(f"""
@@ -79,6 +81,7 @@ def enable_week(engine, tournament, start, end, fixture_ids=None):
         """), scope)
         if cycle and result.rowcount:
             connection.execute(text("UPDATE poll_cycles SET revision=revision+1 WHERE id=:cycle"), scope)
+        return result.rowcount
 
 
 def reopen_selected(engine, tournament, start, end, fixture_ids):
