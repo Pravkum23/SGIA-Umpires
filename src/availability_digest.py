@@ -2,6 +2,10 @@
 import json
 import os
 import sys
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import make_msgid
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
@@ -56,6 +60,11 @@ def build_digest(engine, period, now=None):
 
 
 def provider_config():
+    if os.getenv("DIGEST_CHANNEL") == "email":
+        missing = [key for key in ("DATABASE_URL", "SMTP_USER", "SMTP_PASSWORD", "EMAIL_TO") if not os.getenv(key)]
+        if missing:
+            raise ValueError("Email setup incomplete: " + ", ".join(missing))
+        return "email"
     provider = os.getenv("WHATSAPP_PROVIDER", "meta").lower()
     required = ["DATABASE_URL", "WHATSAPP_TO"]
     if provider == "waha":
@@ -120,16 +129,32 @@ def send_whatsapp(summary):
     return result["messages"][0]["id"]
 
 
+def send_email(summary):
+    message = EmailMessage()
+    message["From"] = os.environ["SMTP_USER"]
+    message["To"] = os.environ["EMAIL_TO"]
+    message["Subject"] = summary.split(" | ", 1)[0]
+    message["Message-ID"] = make_msgid()
+    message.set_content(summary.replace(" | ", "\n\n") +
+                        "\n\nReview: https://sgia-umpires.streamlit.app/?admin=1\n")
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as smtp:
+        smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"].replace(" ", ""))
+        refused = smtp.send_message(message)
+        if refused:
+            raise RuntimeError("Email recipient refused")
+    return str(message["Message-ID"])
+
+
 def main():
     try:
-        provider_config()
+        provider = provider_config()
     except ValueError as error:
         sys.exit(str(error))
     period = os.environ["DIGEST_PERIOD"]
     engine = get_engine()
     try:
         key, summary = build_digest(engine, period)
-        if len(summary) > 30000:
+        if provider != "email" and len(summary) > 30000:
             raise ValueError("Summary exceeds WhatsApp template length.")
         # Reserve before sending. An interrupted or ambiguous send is reviewed
         # manually, so rerunning a workflow cannot send the same report twice.
@@ -148,14 +173,14 @@ def main():
         if not claimed:
             print("This report was already sent or has a pending send. No duplicate sent.")
             return
-        message_id = send_whatsapp(summary)
+        message_id = send_email(summary) if provider == "email" else send_whatsapp(summary)
         with engine.begin() as c:
             c.execute(text("""UPDATE availability_digest_delivery
                 SET status='ACCEPTED',message_id=:message WHERE digest_key=:key"""),
                 {"message": message_id, "key": key})
-        print("WhatsApp accepted the availability summary.")
+        print("Provider accepted the availability summary.")
     except Exception:
-        sys.exit("Summary failed. Check WhatsApp configuration and delivery status before retrying. Private data withheld.")
+        sys.exit("Summary failed. Check delivery configuration and delivery status before retrying. Private data withheld.")
     finally:
         engine.dispose()
 

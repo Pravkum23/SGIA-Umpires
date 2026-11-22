@@ -1,3 +1,29 @@
+# Current delivery: email
+
+The scheduled workflow now sends to kumprav001@gmail.com using Gmail SMTP over TLS.
+Monday 14:00 Singapore covers Tuesday–Friday; Thursday 21:00 covers Saturday–Sunday.
+WhatsApp delivery is no longer scheduled. Its adapters below remain optional.
+
+One-time setup: create a Google App Password for the sender account (default
+kumprav001@gmail.com) at https://myaccount.google.com/apppasswords, then store it
+as the repository Actions secret `SMTP_PASSWORD`. Do not use a normal Google
+password or commit the app password. Google requires 2-Step Verification and
+some account policies do not permit app passwords.
+
+The existing DATABASE_URL secret is reused. Optional variable SMTP_USER selects
+a different Gmail sender; the app password must belong to that sender. Set
+SGIA_EMAIL_ENABLED=false to pause. Missing SMTP_PASSWORD skips sending with an
+explicit workflow warning. Once added, manually run Email availability summary
+and verify receipt before relying on the schedules. No email has been sent during
+implementation. GitHub cron jobs may run late.
+
+Reports contain names and per-match availability, with no private report content
+in workflow logs. The same weekly reservation prevents duplicates across channels.
+SMTP acceptance does not guarantee inbox delivery; check spam. Ambiguous failures
+remain PENDING and require checking delivery before clearing a reservation.
+
+## Legacy WhatsApp setup (not scheduled)
+
 # WhatsApp availability summary
 
 The report covers SHL5 Tuesday–Friday on Monday at 14:00 Singapore time, and
