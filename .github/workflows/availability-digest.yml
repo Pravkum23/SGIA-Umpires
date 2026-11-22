@@ -30,6 +30,10 @@ jobs:
         env:
           DIGEST_PERIOD: ${{ github.event.inputs.period || (github.event.schedule == '0 13 * * 4' && 'weekend' || 'weekdays') }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          WHATSAPP_PROVIDER: ${{ vars.WHATSAPP_PROVIDER || 'meta' }}
+          WAHA_URL: ${{ secrets.WAHA_URL }}
+          WAHA_API_KEY: ${{ secrets.WAHA_API_KEY }}
+          WAHA_SESSION: ${{ vars.WAHA_SESSION || 'default' }}
           WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
           WHATSAPP_ACCESS_TOKEN: ${{ secrets.WHATSAPP_ACCESS_TOKEN }}
           WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}

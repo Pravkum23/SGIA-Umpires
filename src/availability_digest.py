@@ -1,9 +1,10 @@
-"""Scheduled SHL5 availability summaries sent through WhatsApp Cloud API."""
+"""Scheduled SHL5 availability summaries sent through Meta Cloud API or self-hosted WAHA."""
 import json
 import os
 import sys
 from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from sqlalchemy import text
 
@@ -54,7 +55,49 @@ def build_digest(engine, period, now=None):
     return f"{monday.date()}:{period}", summary
 
 
+def provider_config():
+    provider = os.getenv("WHATSAPP_PROVIDER", "meta").lower()
+    required = ["DATABASE_URL", "WHATSAPP_TO"]
+    if provider == "waha":
+        required += ["WAHA_URL", "WAHA_API_KEY"]
+    elif provider == "meta":
+        required += ["WHATSAPP_TEMPLATE", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN"]
+    else:
+        raise ValueError("Unknown WhatsApp provider")
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        raise ValueError("WhatsApp setup incomplete: " + ", ".join(missing))
+    if provider == "waha":
+        endpoint = urlsplit(os.environ["WAHA_URL"])
+        if (endpoint.scheme != "https" or not endpoint.hostname or endpoint.username
+                or endpoint.password or endpoint.query or endpoint.fragment):
+            raise ValueError("WAHA_URL must be an HTTPS URL without credentials or query parameters")
+        recipient = os.environ["WHATSAPP_TO"].lstrip("+")
+        if not recipient.isascii() or not recipient.isdigit() or not 7 <= len(recipient) <= 15:
+            raise ValueError("WHATSAPP_TO must be a phone number with country code")
+    return provider
+
+
+def send_waha(summary):
+    request = Request(
+        os.environ["WAHA_URL"].rstrip("/") + "/api/sendText",
+        data=json.dumps({"session": os.getenv("WAHA_SESSION") or "default",
+                         "chatId": os.environ["WHATSAPP_TO"].lstrip("+") + "@c.us",
+                         "text": summary.replace(" | ", "\n\n")}).encode(),
+        headers={"X-Api-Key": os.environ["WAHA_API_KEY"], "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=30) as response:
+        result = json.load(response)
+    message_id = result.get("id")
+    if not isinstance(message_id, str) or not message_id:
+        raise ValueError("WAHA did not return a message ID")
+    return message_id
+
+
 def send_whatsapp(summary):
+    if os.getenv("WHATSAPP_PROVIDER", "meta").lower() == "waha":
+        return send_waha(summary)
     payload = {
         "messaging_product": "whatsapp",
         "to": os.environ["WHATSAPP_TO"],
@@ -78,11 +121,10 @@ def send_whatsapp(summary):
 
 
 def main():
-    required = ("DATABASE_URL", "WHATSAPP_TO", "WHATSAPP_TEMPLATE",
-                "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ACCESS_TOKEN")
-    missing = [key for key in required if not os.getenv(key)]
-    if missing:
-        sys.exit("WhatsApp setup incomplete: " + ", ".join(missing))
+    try:
+        provider_config()
+    except ValueError as error:
+        sys.exit(str(error))
     period = os.environ["DIGEST_PERIOD"]
     engine = get_engine()
     try:
