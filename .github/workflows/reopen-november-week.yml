@@ -1,0 +1,38 @@
+name: Restore next week availability
+on:
+  push:
+    paths: ['.github/workflows/reopen-november-week.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'SQLAlchemy>=2.0,<3' 'psycopg2-binary>=2.9,<3'
+      - name: Reopen frozen matches and verify
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          from src.db import get_engine, rows
+          from src.weekly import enable_week
+          db = get_engine()
+          scope = {"start": datetime(2026,11,23), "end": datetime(2026,11,30)}
+          query = "SELECT id,starts_at,poll_state FROM fixtures WHERE tournament='SHL5' AND starts_at>=:start AND starts_at<:end AND match_status='SCHEDULED' ORDER BY starts_at"
+          before = rows(db, query, scope)
+          ids = [r["id"] for r in before if r["poll_state"] == "FROZEN"]
+          print("Before:", [(str(r["starts_at"]),r["poll_state"]) for r in before])
+          opened = enable_week(db, "SHL5", scope["start"], scope["end"], ids)
+          print("Reopened frozen matches:", opened)
+          after = rows(db, query, scope)
+          print("After:", [(str(r["starts_at"]),r["poll_state"]) for r in after])
+          assert all(r["poll_state"] == "OPEN" for r in after if r["id"] in ids)
+          db.dispose()
+          PY
