@@ -6,7 +6,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from email.utils import make_msgid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
@@ -23,17 +23,33 @@ def build_digest(engine, period, now=None):
     first, last = offsets[period]
     start, end = monday + timedelta(days=first), monday + timedelta(days=last)
     scope = {"start": start, "end": end}
+    fixtures = rows(engine, """
+        SELECT id,starts_at,home_team,away_team FROM fixtures
+        WHERE tournament='SHL5' AND starts_at>=:start AND starts_at<:end
+        AND match_status='SCHEDULED' ORDER BY starts_at,id
+    """, scope)
     people = rows(engine, """
-        SELECT DISTINCT p.id,p.name
+        SELECT DISTINCT a.fixture_id,p.id,p.name
         FROM availability a JOIN people p ON p.id=a.person_id
         JOIN fixtures f ON f.id=a.fixture_id
         WHERE f.tournament='SHL5' AND f.starts_at>=:start AND f.starts_at<:end
         AND f.match_status='SCHEDULED' AND p.active=true
         ORDER BY p.name,p.id
     """, scope)
+    names_by_match = {}
+    for person in people:
+        names_by_match.setdefault(person["fixture_id"], []).append(" ".join(person["name"].split()))
+
     subject = f"SHL5 availability {start:%d %b}–{end - timedelta(days=1):%d %b %Y}"
-    names = [" ".join(person["name"].split()) for person in people]
-    summary = " | ".join([subject, *(names or ["No availability submitted."])])
+    sections = []
+    for match in fixtures:
+        when = match["starts_at"]
+        if isinstance(when, str):
+            when = datetime.fromisoformat(when)
+        heading = f"{when:%a %d %b, %I:%M %p} — {match['home_team']} vs {match['away_team']}"
+        names = ", ".join(names_by_match.get(match["id"], []))
+        sections.append(f"{heading}: {names or 'No availability submitted.'}")
+    summary = " | ".join([subject, *(sections or ["No scheduled matches."])])
     return f"{monday.date()}:{period}", summary
 
 
@@ -114,7 +130,7 @@ def send_email(summary):
     subject, _, names = summary.partition(" | ")
     message["Subject"] = subject
     message["Message-ID"] = make_msgid()
-    message.set_content(names.replace(" | ", "\n"))
+    message.set_content(names.replace(" | ", "\n\n"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as smtp:
         smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"].replace(" ", ""))
         refused = smtp.send_message(message)
