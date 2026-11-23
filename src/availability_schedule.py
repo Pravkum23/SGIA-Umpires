@@ -5,7 +5,8 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from .db import get_engine
-from .weekly import close_past_matches, enable_week, singapore_now, week_bounds
+from .match_closeout import close_past_matches
+from .weekly import enable_week, singapore_now, week_bounds
 
 
 def open_due_availability(engine, now=None):

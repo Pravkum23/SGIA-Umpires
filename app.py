@@ -33,7 +33,8 @@ from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
 from src.availability_schedule import open_due_availability
-from src.weekly import WEEK_FILTER, close_past_matches, close_week, enable_week, reopen_selected, singapore_now, week_bounds
+from src.match_closeout import close_past_matches
+from src.weekly import WEEK_FILTER, close_week, enable_week, reopen_selected, singapore_now, week_bounds
 from src.workload import fixture_history, season_workload, set_match_status
 from src.tournaments import create_tournament
 
