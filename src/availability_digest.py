@@ -6,7 +6,7 @@ import smtplib
 import ssl
 from email.message import EmailMessage
 from email.utils import make_msgid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit
 
@@ -14,7 +14,6 @@ from sqlalchemy import text
 
 from .db import get_engine, rows
 from .weekly import singapore_now, week_bounds
-from .live_poll import coverage_status
 
 
 def build_digest(engine, period, now=None):
@@ -24,38 +23,17 @@ def build_digest(engine, period, now=None):
     first, last = offsets[period]
     start, end = monday + timedelta(days=first), monday + timedelta(days=last)
     scope = {"start": start, "end": end}
-    fixtures = rows(engine, """
-        SELECT id,starts_at,home_team,away_team FROM fixtures
-        WHERE tournament='SHL5' AND starts_at>=:start AND starts_at<:end
-        AND match_status='SCHEDULED' ORDER BY starts_at,id
-    """, scope)
     people = rows(engine, """
-        SELECT a.fixture_id,p.id,p.name,p.can_umpire,p.can_score
+        SELECT DISTINCT p.id,p.name
         FROM availability a JOIN people p ON p.id=a.person_id
         JOIN fixtures f ON f.id=a.fixture_id
         WHERE f.tournament='SHL5' AND f.starts_at>=:start AND f.starts_at<:end
-        AND f.match_status='SCHEDULED' AND p.active=true ORDER BY p.name
+        AND f.match_status='SCHEDULED' AND p.active=true
+        ORDER BY p.name,p.id
     """, scope)
-    available_ids = {p["id"] for p in people}
-    roster = rows(engine, "SELECT id,name FROM people WHERE active=true ORDER BY name")
-    names = lambda records: ", ".join(p["name"] for p in records) or "None"
-    lines = [
-        f"SHL5 availability {start:%d %b}–{end - timedelta(days=1):%d %b %Y}",
-        f"Available for at least one match: {names([p for p in roster if p['id'] in available_ids])}",
-        f"No availability selected for these matches: {names([p for p in roster if p['id'] not in available_ids])}",
-    ]
-    for f in fixtures:
-        when = f["starts_at"]
-        when = datetime.fromisoformat(when) if isinstance(when, str) else when
-        available = [p for p in people if p["fixture_id"] == f["id"]]
-        lines.append(f"{when:%a %d %b %I:%M %p}: {f['home_team']} vs {f['away_team']}. "
-                     f"Umpires: {names([p for p in available if p['can_umpire']])}. "
-                     f"Scorers: {names([p for p in available if p['can_score']])}. "
-                     f"Coverage: {coverage_status(available)}.")
-    if not fixtures:
-        lines.append("No scheduled matches.")
-    # Template parameters must be single-line strings.
-    summary = " | ".join(" ".join(line.split()) for line in lines)
+    subject = f"SHL5 availability {start:%d %b}–{end - timedelta(days=1):%d %b %Y}"
+    names = [" ".join(person["name"].split()) for person in people]
+    summary = " | ".join([subject, *(names or ["No availability submitted."])])
     return f"{monday.date()}:{period}", summary
 
 
@@ -133,10 +111,10 @@ def send_email(summary):
     message = EmailMessage()
     message["From"] = os.environ["SMTP_USER"]
     message["To"] = os.environ["EMAIL_TO"]
-    message["Subject"] = summary.split(" | ", 1)[0]
+    subject, _, names = summary.partition(" | ")
+    message["Subject"] = subject
     message["Message-ID"] = make_msgid()
-    message.set_content(summary.replace(" | ", "\n\n") +
-                        "\n\nReview: https://sgia-umpires.streamlit.app/?admin=1\n")
+    message.set_content(names.replace(" | ", "\n"))
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=30) as smtp:
         smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"].replace(" ", ""))
         refused = smtp.send_message(message)
