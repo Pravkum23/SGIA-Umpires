@@ -6,6 +6,8 @@ on:
     - cron: '0 10 * * 1'
     # Daily catch-up for delayed runs or newly imported fixtures.
     - cron: '17 14 * * *'
+    # Close past fixtures shortly after midnight Singapore time.
+    - cron: '17 16 * * *'
   workflow_dispatch:
 permissions:
   contents: read

@@ -106,7 +106,7 @@ def test_weekly_admin_selection_and_tournament_switch(monkeypatch, tmp_path):
     page.session_state["admin_ok"] = True
     page.run(timeout=30)
     page.selectbox(key="admin_tournament").set_value("SHL5").run(timeout=30)
-    page.date_input(key="weekly_date").set_value(start.date()).run(timeout=30)
+    next(field for field in page.date_input if field.label == "Week containing").set_value(start.date()).run(timeout=30)
     next(r for r in page.radio if r.label == "Choose matches").set_value("Tuesday–Friday").run(timeout=30)
     assert not list(page.exception)
     assert len(page.multiselect[0].value) == 1

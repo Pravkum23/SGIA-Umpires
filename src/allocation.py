@@ -120,6 +120,9 @@ def propose(engine, regenerate_unconfirmed=False, *, week=None, tournament=None,
 
 
 def allocation_message(engine, cycle_id=None, tournament=None):
+    from .weekly import singapore_now
+
+    active_only = cycle_id is None
     with engine.connect() as c:
         if cycle_id is None:
             cycle = current_allocation_cycle(c, tournament)
@@ -131,8 +134,9 @@ def allocation_message(engine, cycle_id=None, tournament=None):
             FROM assignments a JOIN fixtures f ON f.id=a.fixture_id JOIN people p ON p.id=a.person_id
             WHERE (:tournament IS NULL OR f.tournament=:tournament) AND a.confirmed=true AND a.status='ASSIGNED' AND f.poll_cycle_id=:cycle
               AND f.poll_state<>'CLOSED'
+              AND (:active_only=false OR (f.poll_state IN ('OPEN','FROZEN') AND f.match_status='SCHEDULED' AND f.starts_at>:now))
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id, "tournament": tournament}).mappings())
+        """), {"cycle": cycle_id, "tournament": tournament, "active_only": active_only, "now": singapore_now()}).mappings())
     grouped = {}
     for row in data:
         dt = _dt(row.starts_at)

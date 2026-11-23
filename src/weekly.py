@@ -33,13 +33,13 @@ def selected_filter(fixture_ids, scope):
 
 
 def close_week(engine, tournament, start, end, fixture_ids=None):
-    scope = {"tournament": tournament, "start": start, "end": end}
+    scope = {"tournament": tournament, "start": start, "end": end, "now": singapore_now()}
     selected = selected_filter(fixture_ids, scope)
     with engine.begin() as connection:
         lock = " FOR UPDATE" if engine.dialect.name == "postgresql" else ""
         fixtures = connection.execute(text(f"""
             SELECT id,poll_cycle_id FROM fixtures WHERE {WEEK_FILTER}
-            AND poll_state IN ('OPEN','FROZEN'){selected} ORDER BY id{lock}
+            AND starts_at>:now AND poll_state IN ('OPEN','FROZEN'){selected} ORDER BY id{lock}
         """), scope).mappings().all()
         for fixture in fixtures:
             ready = connection.execute(text("""
@@ -101,3 +101,32 @@ def reopen_selected(engine, tournament, start, end, fixture_ids):
                 UPDATE poll_cycles SET status='FROZEN',frozen_at=CURRENT_TIMESTAMP
                 WHERE id=:cycle AND status='PUBLISHED'
             """), {"cycle": cycle})
+
+
+def close_past_matches(engine, now=None):
+    """Complete prior match days in Singapore and retain published history."""
+    today = datetime.combine((now or singapore_now()).date(), datetime.min.time())
+    with engine.begin() as connection:
+        completed = connection.execute(text("""
+            UPDATE fixtures SET match_status='COMPLETED', availability_open=false,
+                poll_state=CASE WHEN poll_state='PUBLISHED' THEN 'PUBLISHED' ELSE 'CLOSED' END
+            WHERE match_status='SCHEDULED' AND starts_at<:today
+            RETURNING id, poll_cycle_id
+        """), {"today": today}).mappings().all()
+        if completed:
+            connection.execute(text("""
+                INSERT INTO fixture_events(fixture_id,event_type,previous_status,new_status)
+                VALUES(:id,'MATCH_COMPLETED','SCHEDULED','COMPLETED')
+            """), [{"id": match["id"]} for match in completed])
+        for cycle in {match["poll_cycle_id"] for match in completed if match["poll_cycle_id"] is not None}:
+            connection.execute(text("""
+                UPDATE poll_cycles
+                SET status=CASE WHEN EXISTS (
+                    SELECT 1 FROM fixtures WHERE poll_cycle_id=:cycle AND poll_state='PUBLISHED'
+                ) THEN 'PUBLISHED' ELSE 'CLOSED' END
+                WHERE id=:cycle AND status IN ('OPEN','FROZEN') AND NOT EXISTS (
+                    SELECT 1 FROM fixtures WHERE poll_cycle_id=:cycle
+                    AND match_status='SCHEDULED' AND poll_state IN ('OPEN','FROZEN')
+                )
+            """), {"cycle": cycle})
+        return len(completed)

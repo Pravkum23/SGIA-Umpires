@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 from sqlalchemy import text
 
 from src.allocation_scope import current_allocation_cycle
+from src.weekly import singapore_now
 
 BOARD_COLUMNS = ["Day", "Date", "Time", "TEAM 1", "TEAM 2", "Umpire 1", "Umpire 2", "Scorer"]
 ROLE_COLUMNS = {"umpire_1": "Umpire 1", "umpire_2": "Umpire 2", "scorer": "Scorer"}
@@ -34,11 +35,11 @@ def allocation_board(engine, confirmed_only=False, cycle_id=None, tournament=Non
             LEFT JOIN people p ON p.id=a.person_id
             WHERE f.poll_cycle_id=:cycle AND f.poll_state<>'CLOSED'
               AND (:tournament IS NULL OR f.tournament=:tournament)
-              AND (:active_only=false OR f.poll_state IN ('OPEN','FROZEN'))
+              AND (:active_only=false OR (f.poll_state IN ('OPEN','FROZEN') AND f.match_status='SCHEDULED' AND f.starts_at>:now))
               AND (:published_only=false OR f.poll_state='PUBLISHED')
               AND EXISTS (SELECT 1 FROM assignments x WHERE x.fixture_id=f.id{exists_filter})
             ORDER BY f.starts_at,a.role
-        """), {"cycle": cycle_id, "tournament": tournament, "active_only": active_only, "published_only": published_only}).mappings())
+        """), {"cycle": cycle_id, "tournament": tournament, "active_only": active_only, "published_only": published_only, "now": singapore_now()}).mappings())
     board = {}
     for row in data:
         starts = _dt(row.starts_at)

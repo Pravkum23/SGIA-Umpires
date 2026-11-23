@@ -1,5 +1,7 @@
 from sqlalchemy import text
 
+from .weekly import singapore_now
+
 
 def current_allocation_cycle(connection, tournament=None):
     """Return the one unpublished cycle the admin is currently preparing.
@@ -13,11 +15,11 @@ def current_allocation_cycle(connection, tournament=None):
         SELECT c.id,c.status,c.revision,c.created_at,c.opened_at,c.frozen_at,c.published_at
         FROM poll_cycles c
         WHERE c.status NOT IN ('PUBLISHED','CLOSED')
-          AND EXISTS (SELECT 1 FROM fixtures f WHERE f.poll_cycle_id=c.id AND f.poll_state IN ('OPEN','FROZEN') AND (:tournament IS NULL OR f.tournament=:tournament))
+          AND EXISTS (SELECT 1 FROM fixtures f WHERE f.poll_cycle_id=c.id AND f.poll_state IN ('OPEN','FROZEN') AND f.match_status='SCHEDULED' AND f.starts_at>:now AND (:tournament IS NULL OR f.tournament=:tournament))
         ORDER BY CASE c.status WHEN 'FROZEN' THEN 1 WHEN 'OPEN' THEN 2 ELSE 3 END,
                  c.id DESC
         LIMIT 1
-    """), {"tournament": tournament}).mappings().first()
+    """), {"tournament": tournament, "now": singapore_now()}).mappings().first()
 
 
 def current_allocation_summary(engine, tournament=None):
@@ -27,8 +29,8 @@ def current_allocation_summary(engine, tournament=None):
             return None
         summary = connection.execute(text("""
             SELECT MIN(starts_at) starts_at,MAX(starts_at) ends_at,COUNT(*) match_count
-            FROM fixtures WHERE poll_cycle_id=:cycle AND poll_state IN ('OPEN','FROZEN') AND (:tournament IS NULL OR tournament=:tournament)
-        """), {"cycle": cycle.id, "tournament": tournament}).mappings().one()
+            FROM fixtures WHERE poll_cycle_id=:cycle AND poll_state IN ('OPEN','FROZEN') AND match_status='SCHEDULED' AND starts_at>:now AND (:tournament IS NULL OR tournament=:tournament)
+        """), {"cycle": cycle.id, "tournament": tournament, "now": singapore_now()}).mappings().one()
         return {**dict(cycle), **dict(summary)}
 
 

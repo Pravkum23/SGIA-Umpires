@@ -33,7 +33,7 @@ from src.live_poll import SGIA_TIMEZONE, live_poll_monitor
 from src.poll_audit import activity_history, coarse_client, record_poll_view, response_audit, response_audit_csv, set_fixture_poll_state, transition_poll_state, update_open_slots
 from src.routing import is_admin_request
 from src.availability_schedule import open_due_availability
-from src.weekly import WEEK_FILTER, close_week, enable_week, reopen_selected, singapore_now, week_bounds
+from src.weekly import WEEK_FILTER, close_past_matches, close_week, enable_week, reopen_selected, singapore_now, week_bounds
 from src.workload import fixture_history, season_workload, set_match_status
 from src.tournaments import create_tournament
 
@@ -310,20 +310,44 @@ def render_week(db, tournament):
     if tournament == "SHL5":
         st.caption("Automatic availability · Friday 9 PM for next Tuesday–Friday · Monday 6 PM for Saturday–Sunday · Singapore time")
     now = singapore_now()
-    day = st.date_input("Week containing", now.date(), key="weekly_date")
+    current_week, _ = week_bounds(now.date())
+    day = st.date_input("Week containing", now.date(), key=f"weekly_date_{tournament}_{current_week:%Y%m%d}")
     start, end = week_bounds(day)
     st.subheader(f"{start:%d %b} – {end - timedelta(days=1):%d %b %Y}")
-    fixtures = rows(db, f"""
+    if notice := st.session_state.pop("schedule_notice", None):
+        st.success(notice)
+    scope = {"tournament": tournament, "start": start, "end": end, "now": now}
+    upcoming = rows(db, f"""
         SELECT id,starts_at,home_team,away_team,poll_state FROM fixtures
-        WHERE {WEEK_FILTER} ORDER BY starts_at
-    """, {"tournament": tournament, "start": start, "end": end})
-    upcoming = [f for f in fixtures if pd.Timestamp(f["starts_at"]) > now]
+        WHERE {WEEK_FILTER} AND starts_at>:now ORDER BY starts_at,id
+    """, scope)
     if not upcoming:
-        st.caption("No upcoming matches this week. Choose another week or add a fixture.")
+        st.info("No upcoming matches for this week.")
+        return
+    saved = rows(db, f"""
+        SELECT a.fixture_id,a.role,p.name,a.confirmed,a.status
+        FROM assignments a JOIN people p ON p.id=a.person_id
+        WHERE a.fixture_id IN (SELECT id FROM fixtures WHERE {WEEK_FILTER} AND starts_at>:now)
+    """, scope)
+    by_match = {}
+    for duty in saved:
+        by_match.setdefault(duty["fixture_id"], {})[duty["role"]] = duty
     for match in upcoming:
+        duties = by_match.get(match["id"], {})
         label = {"OPEN": "Collecting availability", "FROZEN": "Ready to allocate",
-                 "PUBLISHED": "Allocation published"}.get(match["poll_state"], "Ready to enable")
+                 "PUBLISHED": "Published"}.get(match["poll_state"], "Ready to enable")
+        if match["poll_state"] != "PUBLISHED" and duties:
+            label = "Saved · ready to publish" if all(
+                role in duties and duties[role]["confirmed"] and duties[role]["status"] == "ASSIGNED"
+                for role in ("umpire_1", "umpire_2", "scorer")
+            ) else "Allocation in progress"
         st.write(f"**{pd.Timestamp(match['starts_at']):%a %d %b · %I:%M %p}** · {match['home_team']} vs {match['away_team']} · {label}")
+        if duties:
+            st.caption(" · ".join(
+                f"{title}: {duties[role]['name']}" + (" (replacement needed)" if duties[role]["status"] == "REPLACEMENT_REQUIRED" else "")
+                for role, title in (("umpire_1", "Umpire 1"), ("umpire_2", "Umpire 2"), ("scorer", "Scorer"))
+                if role in duties
+            ))
     selection_key = f"weekly_selection_{tournament}_{start:%Y%m%d}"
     preset = st.radio("Choose matches", ["Entire week", "Tuesday–Friday", "Saturday–Sunday", "Pick matches"], horizontal=True, key=selection_key)
     candidates = upcoming
@@ -374,7 +398,8 @@ def render_week(db, tournament):
                     choices = [record[key] for key in ("Umpire 1", "Umpire 2", "Scorer")]
                     if all(choices) and len(set(choices)) == 3:
                         save_allocation_board(db, [record])
-                        st.success("Allocation saved.")
+                        st.session_state["schedule_notice"] = "Allocation saved. Use Publish selected matches to share it with officials."
+                        st.rerun()
                     else:
                         st.warning("Choose three different officials.")
     if st.button("Publish selected matches and close availability"):
@@ -409,7 +434,7 @@ def render_admin(db):
                     st.error(str(error))
     # Streamlit tabs eagerly execute every panel on every widget interaction.
     # Conditional navigation keeps Supabase work limited to the visible page.
-    admin_sections = ["Weekly matches", "Fixtures", "Season Workload", "More tools"]
+    admin_sections = ["Schedule", "Fixtures", "Season Workload", "More tools"]
     admin_section = st.radio(
         "Admin section",
         admin_sections,
@@ -417,7 +442,7 @@ def render_admin(db):
         label_visibility="collapsed",
         key="admin_navigation",
     )
-    if admin_section == "Weekly matches":
+    if admin_section == "Schedule":
         render_week(db, tournament)
         return
     if admin_section == "More tools":
@@ -804,7 +829,7 @@ def render_admin(db):
         """, {"tournament": tournament, "start": start, "end": end})
         for match in scheduled:
             if match["poll_state"] in ("CLOSED", "PUBLISHED"):
-                state = "Enable in Weekly matches" if match["poll_state"] == "CLOSED" else "Allocation published"
+                state = "Enable in Schedule" if match["poll_state"] == "CLOSED" else "Allocation published"
                 st.write(f"{date_label(match['starts_at'])} · {match['home_team']} vs {match['away_team']} · {state}")
         review_rows = allocation_review(db, tournament=tournament, week=(start, end))
         left, right, confirm_all_col = st.columns(3)
@@ -1094,7 +1119,7 @@ def render_admin(db):
         allocation_summary = current_allocation_summary(db, tournament=tournament)
         if allocation_summary:
             st.caption(allocation_cycle_caption(allocation_summary) + ". Exports include only complete confirmed assignments in this batch.")
-        final_board = confirmed_allocation_board(db, cycle_id=allocation_summary["id"], tournament=tournament) if allocation_summary else []
+        final_board = confirmed_allocation_board(db, tournament=tournament) if allocation_summary else []
         if not allocation_summary:
             st.info("No current allocation is being prepared.")
         elif not final_board:
@@ -1109,7 +1134,7 @@ def render_admin(db):
             png_col.download_button("Download PNG", final_png, "sgia-official-allocation.png", "image/png", use_container_width=True)
             csv_col.download_button("Download CSV", allocation_board_csv(final_board), "sgia-official-allocation.csv", "text/csv", use_container_width=True)
         st.markdown("#### WhatsApp text")
-        message = allocation_message(db, cycle_id=allocation_summary["id"], tournament=tournament) if allocation_summary else "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
+        message = allocation_message(db, tournament=tournament) if allocation_summary else "\U0001f3cf *SGIA Umpires \u2013 Final Allocation*\n"
         st.text_area("Copy WhatsApp Message", message, height=360)
 
 
@@ -1118,7 +1143,9 @@ db = engine(schema_version="workload-duties-v1")
 
 @st.fragment(run_every="60s")
 def check_availability_schedule():
-    if open_due_availability(db):
+    closed = close_past_matches(db)
+    opened = open_due_availability(db)
+    if closed or opened:
         st.rerun()
 
 

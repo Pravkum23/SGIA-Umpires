@@ -5,7 +5,7 @@ from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from .db import get_engine
-from .weekly import enable_week, singapore_now, week_bounds
+from .weekly import close_past_matches, enable_week, singapore_now, week_bounds
 
 
 def open_due_availability(engine, now=None):
@@ -32,6 +32,8 @@ def main():
         sys.exit("Set the GitHub Actions DATABASE_URL secret to the app's database connection.")
     engine = get_engine()
     try:
+        closed = close_past_matches(engine)
+        print(f"Automatically completed {closed} past matches.")
         count = open_due_availability(engine)
         print(f"Opened {count} SHL5 matches for availability.")
     except Exception:
