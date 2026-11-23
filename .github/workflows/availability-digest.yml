@@ -2,7 +2,9 @@ name: Email availability summary
 on:
   schedule:
     - cron: '0 6 * * 1'
+    - cron: '10 6 * * 1'
     - cron: '0 13 * * 4'
+    - cron: '10 13 * * 4'
   workflow_dispatch:
     inputs:
       period:
@@ -43,7 +45,7 @@ jobs:
         if: steps.setup.outputs.ready == 'true'
         env:
           DIGEST_CHANNEL: email
-          DIGEST_PERIOD: ${{ github.event.inputs.period || (github.event.schedule == '0 13 * * 4' && 'weekend' || 'weekdays') }}
+          DIGEST_PERIOD: ${{ github.event.inputs.period || ((github.event.schedule == '0 13 * * 4' || github.event.schedule == '10 13 * * 4') && 'weekend' || 'weekdays') }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           EMAIL_TO: kumprav001@gmail.com
           SMTP_USER: ${{ vars.SMTP_USER || 'kumprav001@gmail.com' }}
